@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # --- build stage ---------------------------------------------------
-FROM docker.io/library/golang:1.22-bookworm AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.22-bookworm AS builder
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -13,6 +13,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/clem .
 # --- runtime stage -------------------------------------------------
 FROM docker.io/library/ubuntu:24.04
 
+ARG TARGETARCH
 ARG SOPS_VERSION=3.12.2
 ARG YQ_VERSION=4.52.5
 
@@ -36,12 +37,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/apt/*
 
 # sops (binary release)
-RUN curl -fsSL "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-v${SOPS_VERSION}.linux.amd64" \
+RUN curl -fsSL "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-v${SOPS_VERSION}.linux.${TARGETARCH}" \
         -o /usr/local/bin/sops \
     && chmod +x /usr/local/bin/sops
 
 # yq (binary release — needed by clem vault decrypt merge)
-RUN curl -fsSL "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64" \
+RUN curl -fsSL "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${TARGETARCH}" \
         -o /usr/local/bin/yq \
     && chmod +x /usr/local/bin/yq
 
@@ -51,13 +52,14 @@ RUN pip3 install --break-system-packages --ignore-installed \
 
 # ttyd (read-only web terminal — optional, enabled when web_terminal_port set)
 ARG TTYD_VERSION=1.7.7
-RUN curl -fsSL "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64" \
+RUN TTYD_ARCH=$([ "${TARGETARCH}" = "arm64" ] && echo "aarch64" || echo "x86_64") \
+    && curl -fsSL "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.${TTYD_ARCH}" \
         -o /usr/local/bin/ttyd \
     && chmod +x /usr/local/bin/ttyd
 
 # Slack MCP server (korotovsky/slack-mcp-server — Go binary, MIT)
 ARG SLACK_MCP_VERSION=v1.2.3
-RUN curl -fsSL "https://github.com/korotovsky/slack-mcp-server/releases/download/${SLACK_MCP_VERSION}/slack-mcp-server-linux-amd64" \
+RUN curl -fsSL "https://github.com/korotovsky/slack-mcp-server/releases/download/${SLACK_MCP_VERSION}/slack-mcp-server-linux-${TARGETARCH}" \
         -o /usr/local/bin/slack-mcp-server \
     && chmod +x /usr/local/bin/slack-mcp-server
 
