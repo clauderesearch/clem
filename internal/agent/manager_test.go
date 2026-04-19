@@ -132,6 +132,117 @@ func TestPrePushHook_AllowsCleanPush(t *testing.T) {
 	}
 }
 
+// TestSecretCodePatternRegex_MatchesKnownPatterns verifies the code-scan regex
+// catches Go, Python, and Node patterns that read protected secret env vars.
+func TestSecretCodePatternRegex_MatchesKnownPatterns(t *testing.T) {
+	re, err := regexp.Compile(SecretCodePatternRegex)
+	if err != nil {
+		t.Fatalf("regex compile: %v", err)
+	}
+
+	positives := []struct {
+		name  string
+		input string
+	}{
+		{"go GH_TOKEN", `token := os.Getenv("GH_TOKEN")`},
+		{"go DISCORD_TOKEN", `d := os.Getenv("DISCORD_TOKEN")`},
+		{"go ANTHROPIC_API_KEY", `k := os.Getenv("ANTHROPIC_API_KEY")`},
+		{"go AWS_SECRET_ACCESS_KEY", `s := os.Getenv("AWS_SECRET_ACCESS_KEY")`},
+		{"go SLACK_MCP_XOXP_TOKEN", `t := os.Getenv("SLACK_MCP_XOXP_TOKEN")`},
+		{"python double-quote GH_TOKEN", `tok = os.environ["GH_TOKEN"]`},
+		{"node GH_TOKEN", `const t = process.env.GH_TOKEN`},
+		{"node ANTHROPIC_API_KEY", `const k = process.env.ANTHROPIC_API_KEY`},
+	}
+	for _, tc := range positives {
+		if !re.MatchString(tc.input) {
+			t.Errorf("regex should match %s (%q) but did not", tc.name, tc.input)
+		}
+	}
+}
+
+// TestSecretCodePatternRegex_DoesNotMatchBenign ensures benign env reads are
+// not flagged. False positives teach developers to always --no-verify.
+func TestSecretCodePatternRegex_DoesNotMatchBenign(t *testing.T) {
+	re, err := regexp.Compile(SecretCodePatternRegex)
+	if err != nil {
+		t.Fatalf("regex compile: %v", err)
+	}
+
+	negatives := []struct {
+		name  string
+		input string
+	}{
+		{"go PATH", `p := os.Getenv("PATH")`},
+		{"go HOME", `h := os.Getenv("HOME")`},
+		{"go unrelated name", `x := os.Getenv("MY_APP_CONFIG")`},
+		{"python HOME", `h = os.environ["HOME"]`},
+		{"node NODE_ENV", `const e = process.env.NODE_ENV`},
+		{"node PORT", `const p = process.env.PORT`},
+		{"comment mentioning GH_TOKEN", `// reads GH_TOKEN from the environment`},
+	}
+	for _, tc := range negatives {
+		if re.MatchString(tc.input) {
+			t.Errorf("regex should NOT match %s (%q) but did", tc.name, tc.input)
+		}
+	}
+}
+
+// TestPrePushHookContent_EmbedsCodePattern ensures the hook template embeds the
+// code pattern regex and the skip-env variable name.
+func TestPrePushHookContent_EmbedsCodePattern(t *testing.T) {
+	if !strings.Contains(prePushHookContent, SecretCodePatternRegex) {
+		t.Error("pre-push hook should embed SecretCodePatternRegex verbatim")
+	}
+	if !strings.Contains(prePushHookContent, "CLEM_HOOK_SKIP_CODE_SCAN") {
+		t.Error("pre-push hook should reference CLEM_HOOK_SKIP_CODE_SCAN escape hatch")
+	}
+}
+
+// TestPrePushHook_BlocksCodeSecretRead verifies the hook exits non-zero when
+// the diff contains a Go os.Getenv call on a protected secret env var name.
+func TestPrePushHook_BlocksCodeSecretRead(t *testing.T) {
+	for _, bin := range []string{"bash", "grep"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not on PATH - skipping integration test", bin)
+		}
+	}
+
+	hookPath := writeTestableHook(t,
+		`echo '+	tok := os.Getenv("GH_TOKEN")'`)
+
+	cmd := exec.Command("bash", hookPath)
+	cmd.Stdin = strings.NewReader("refs/heads/feature aaa refs/heads/feature bbb\n")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("hook should have exited non-zero on code secret read, got exit 0. output:\n%s", out)
+	}
+	if !strings.Contains(string(out), "push blocked") {
+		t.Errorf("hook output missing 'push blocked' message:\n%s", out)
+	}
+}
+
+// TestPrePushHook_AllowsCodeReadWithSkipEnv verifies that setting
+// CLEM_HOOK_SKIP_CODE_SCAN=1 bypasses the code-pattern pass while still
+// running the credential-literal pass.
+func TestPrePushHook_AllowsCodeReadWithSkipEnv(t *testing.T) {
+	for _, bin := range []string{"bash", "grep"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not on PATH - skipping integration test", bin)
+		}
+	}
+
+	hookPath := writeTestableHook(t,
+		`echo '+	tok := os.Getenv("GH_TOKEN")'`)
+
+	cmd := exec.Command("bash", hookPath)
+	cmd.Env = append(cmd.Environ(), "CLEM_HOOK_SKIP_CODE_SCAN=1")
+	cmd.Stdin = strings.NewReader("refs/heads/feature aaa refs/heads/feature bbb\n")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hook should have exited 0 with CLEM_HOOK_SKIP_CODE_SCAN=1, got error %v. output:\n%s", err, out)
+	}
+}
+
 // writeTestableHook writes a copy of prePushHookContent to a temp file with
 // the $diff_cmd substring replaced by a stubbed command that emits a fixed
 // payload. Returns the path.
@@ -139,7 +250,7 @@ func writeTestableHook(t *testing.T, stubDiffCmd string) string {
 	t.Helper()
 	dir := t.TempDir()
 	hookPath := filepath.Join(dir, "pre-push")
-	patched := strings.Replace(prePushHookContent, "$diff_cmd", stubDiffCmd, 1)
+	patched := strings.Replace(prePushHookContent, "$diff_cmd", stubDiffCmd, 2)
 	if err := os.WriteFile(hookPath, []byte(patched), 0755); err != nil {
 		t.Fatalf("write hook: %v", err)
 	}

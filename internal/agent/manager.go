@@ -108,15 +108,31 @@ func chownToUser(path, username string) error {
 // false positives block pushes, which is annoying but safe.
 const SecretPatternRegex = `ghp_[A-Za-z0-9]{36}|gho_[A-Za-z0-9]{36}|ghs_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{70,}|sk-[A-Za-z0-9_-]{20,}|xox[bapr]-[0-9A-Za-z-]{10,}|AKIA[0-9A-Z]{16}|AGE-SECRET-KEY-1[A-Z0-9]+|-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----`
 
+// SecretCodePatternRegex is the ERE alternation the pre-push hook uses as a
+// second pass: it detects code that reads protected secret env vars at runtime
+// (Go, Python, Node). Exported so tests share one source of truth with the
+// bash hook. Shell variable expansions are excluded — false-positive rate is
+// too high in shell scripts that legitimately forward these vars.
+// To skip this pass for a repo where the reads are intentional and reviewed,
+// push with CLEM_HOOK_SKIP_CODE_SCAN=1 in the environment.
+// Single-quoted Python access (os.environ['KEY']) is intentionally excluded:
+// the single quote cannot appear inside a bash single-quoted assignment without
+// complex escaping, and double-quoted access is the dominant style for secrets.
+const SecretCodePatternRegex = `os\.Getenv\("(GH_TOKEN|DISCORD_TOKEN|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY|SLACK_MCP_XOXP_TOKEN)"\)|os\.environ\["(GH_TOKEN|DISCORD_TOKEN|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY|SLACK_MCP_XOXP_TOKEN)"\]|process\.env\.(GH_TOKEN|DISCORD_TOKEN|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY|SLACK_MCP_XOXP_TOKEN)`
+
 // prePushHookContent is the pre-push hook installed for every agent user.
-// Pure bash + grep; no gitleaks dependency. The regex comes from
-// SecretPatternRegex so Go tests and the bash hook share one source of truth.
+// Pure bash + grep; no gitleaks dependency. The regexes come from
+// SecretPatternRegex and SecretCodePatternRegex so Go tests and the bash
+// hook share one source of truth.
 var prePushHookContent = fmt.Sprintf(`#!/bin/bash
 # Installed by clem provision. Do not edit by hand - will be overwritten.
-# Refuses to push commits whose diff contains patterns matching common secrets.
+# Pass 1-3: literal credential patterns (tokens, keys, PEM blocks).
+# Pass 4:   code that reads protected secret env vars (Go/Python/Node).
+#           Skip with: CLEM_HOOK_SKIP_CODE_SCAN=1 git push
 
 zero="0000000000000000000000000000000000000000"
 patterns='%s'
+code_patterns='%s'
 
 while read local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "$zero" ] && continue
@@ -137,9 +153,19 @@ while read local_ref local_sha remote_ref remote_sha; do
     echo "for a false positive, push with --no-verify (think first)." >&2
     exit 1
   fi
+  if [ "${CLEM_HOOK_SKIP_CODE_SCAN:-0}" != "1" ]; then
+    code_hits=$($diff_cmd 2>/dev/null | grep -E "$code_patterns" | head -3)
+    if [ -n "$code_hits" ]; then
+      echo "clem pre-push hook: push blocked - diff reads a protected secret env var in $range" >&2
+      echo "$code_hits" | sed 's/^/  /' >&2
+      echo "" >&2
+      echo "Set CLEM_HOOK_SKIP_CODE_SCAN=1 if this read is intentional and reviewed." >&2
+      exit 1
+    fi
+  fi
 done
 exit 0
-`, SecretPatternRegex)
+`, SecretPatternRegex, SecretCodePatternRegex)
 
 // InstallGitHooks writes a global pre-push hook for the agent user and points
 // their git config at it via core.hooksPath. Idempotent - safe to call every
