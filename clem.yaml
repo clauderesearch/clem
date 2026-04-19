@@ -13,6 +13,7 @@ agents:
     name: "Amara"
     role: "Lead Software Engineer"
     model: "claude-sonnet-4-6"
+    subagent_model: "claude-sonnet-4-6"
     iteration: 10m
     prompt: "Act as Amara per CLAUDE.local.md. Check Discord #tasks for tasks assigned to you. Work on ONE task. When done post results and run: kill $PPID. If no tasks: kill $PPID"
 
@@ -20,6 +21,7 @@ agents:
     name: "Athena"
     role: "Software Engineer"
     model: "claude-sonnet-4-6"
+    subagent_model: "claude-sonnet-4-6"
     iteration: 5m
     reports_to: lead
     prompt: "Act as Athena per CLAUDE.local.md. Check Discord #tasks for tasks assigned to you. Work on ONE task. When done post results and run: kill $PPID. If no tasks: kill $PPID"

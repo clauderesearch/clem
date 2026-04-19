@@ -282,6 +282,7 @@ agents:
     prompt: string          # injected at start of each session
     web_terminal_port: int  # optional — ttyd port (1024-65535) for read-only viewing
     caveman: bool           # optional — install caveman plugin (compresses output ~75%)
+    subagent_model: string  # optional — CLAUDE_CODE_SUBAGENT_MODEL for Task tool / Explore / general-purpose
     provider: string        # optional — anthropic (default) | bedrock | vertex | ollama | openai-compat
     provider_url: string    # required when provider is ollama or openai-compat
     runtime: string         # optional — claude-code (default) | opencode

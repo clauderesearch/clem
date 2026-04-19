@@ -25,7 +25,7 @@ tail -500 "$LOGFILE" > "$LOGFILE.tmp" 2>/dev/null && mv "$LOGFILE.tmp" "$LOGFILE
 
 # Load secrets (written by clem provision, never committed)
 [ -f "$HOME/.env" ] && source "$HOME/.env"
-
+{{.SubagentExport}}
 # Write ephemeral .mcp.json from env (python3 ensures correct JSON encoding)
 python3 -c "
 import json, os
@@ -161,7 +161,7 @@ log() { echo "$(date -Iseconds) $1" | tee -a "$LOGFILE"; }
 tail -500 "$LOGFILE" > "$LOGFILE.tmp" 2>/dev/null && mv "$LOGFILE.tmp" "$LOGFILE" 2>/dev/null
 
 [ -f "$HOME/.env" ] && source "$HOME/.env"
-
+{{.SubagentExport}}
 # Write opencode.json with Ollama provider + discord-bot MCP (if token is set).
 python3 -c "
 import json, os
@@ -273,19 +273,20 @@ WantedBy=multi-user.target
 `
 
 type RunnerParams struct {
-	Project      string
-	AgentKey     string
-	AgentName    string
-	Model        string
-	Prompt       string
-	OSUser       string
-	HomeDir      string
-	SleepActive  int
-	SleepNight   int
-	TtydPort     int
-	TtydBind     string
-	AlertChannel string
-	AlertCurl    string
+	Project        string
+	AgentKey       string
+	AgentName      string
+	Model          string
+	SubagentExport string
+	Prompt         string
+	OSUser         string
+	HomeDir        string
+	SleepActive    int
+	SleepNight     int
+	TtydPort       int
+	TtydBind       string
+	AlertChannel   string
+	AlertCurl      string
 }
 
 // Generate renders the runner.sh content for an agent. Dispatches on the
@@ -314,18 +315,23 @@ func Generate(cfg *config.Config, agentKey string) string {
 	alertMsg := fmt.Sprintf(`⚠️ %s: CLAUDE.local.md is ${SIZE} bytes (>${MAX_CLAUDE_MD_BYTES}). Trim it to reduce token waste.`, ac.Name)
 	alertCurl := fmt.Sprintf(`[ -n "$%s" ] && %s`, backend.TokenEnvVar, fmt.Sprintf(backend.AlertTemplate, alertChannel, alertMsg))
 
+	subagentExport := ""
+	if ac.SubagentModel != "" {
+		subagentExport = fmt.Sprintf("export CLAUDE_CODE_SUBAGENT_MODEL=%q", ac.SubagentModel)
+	}
 	p := RunnerParams{
-		Project:      cfg.Project,
-		AgentKey:     agentKey,
-		AgentName:    ac.Name,
-		Model:        ac.Model,
-		Prompt:       strings.ReplaceAll(promptText, "'", `'\''`),
-		OSUser:       cfg.OSUsername(agentKey),
-		HomeDir:      fmt.Sprintf("/home/%s", cfg.OSUsername(agentKey)),
-		SleepActive:  iterSec,
-		SleepNight:   iterSec * 2,
-		AlertChannel: alertChannel,
-		AlertCurl:    alertCurl,
+		Project:        cfg.Project,
+		AgentKey:       agentKey,
+		AgentName:      ac.Name,
+		Model:          ac.Model,
+		SubagentExport: subagentExport,
+		Prompt:         strings.ReplaceAll(promptText, "'", `'\''`),
+		OSUser:         cfg.OSUsername(agentKey),
+		HomeDir:        fmt.Sprintf("/home/%s", cfg.OSUsername(agentKey)),
+		SleepActive:    iterSec,
+		SleepNight:     iterSec * 2,
+		AlertChannel:   alertChannel,
+		AlertCurl:      alertCurl,
 	}
 	switch ac.RuntimeKind() {
 	case "opencode":
@@ -383,6 +389,7 @@ func renderTemplate(tmpl string, p RunnerParams) string {
 		"{{.TtydPort}}", fmt.Sprintf("%d", p.TtydPort),
 		"{{.AlertChannel}}", p.AlertChannel,
 		"{{.AlertCurl}}", p.AlertCurl,
+		"{{.SubagentExport}}", p.SubagentExport,
 	)
 	return r.Replace(tmpl)
 }

@@ -50,6 +50,11 @@ type AgentConfig struct {
 	// ollama, openai-compat. ollama and openai-compat require ProviderURL.
 	Provider    string `yaml:"provider"`
 	ProviderURL string `yaml:"provider_url"`
+	// SubagentModel sets CLAUDE_CODE_SUBAGENT_MODEL in the runner env so
+	// subagents (Task tool, Explore, general-purpose) use a cheaper model
+	// than the main session. Accepts model aliases (sonnet, haiku, opus) or
+	// full IDs (claude-sonnet-4-6). Empty = inherit main model.
+	SubagentModel string `yaml:"subagent_model"`
 }
 
 // RuntimeKind returns the normalized runtime name for this agent.
