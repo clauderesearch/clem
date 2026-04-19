@@ -256,6 +256,25 @@ func Load(path string) (*Config, error) {
 			}
 			usedPorts[ac.WebTerminalPort] = key
 		}
+		ac.normalizeSubagentModel()
+		cfg.Agents[key] = ac
 	}
 	return &cfg, nil
+}
+
+// DefaultSubagentModel is applied when subagent_model is unset in clem.yaml.
+// Subagents (Task tool, Explore, general-purpose) handle most work well with
+// Sonnet; defaulting avoids silent Opus-on-Opus cost when running an Opus main
+// session. Opt out with subagent_model: "off" in clem.yaml.
+const DefaultSubagentModel = "claude-sonnet-4-6"
+
+// normalizeSubagentModel applies the default and maps the "off" sentinel to
+// empty string. Called from Load after YAML parse so runner.go stays simple.
+func (ac *AgentConfig) normalizeSubagentModel() {
+	switch ac.SubagentModel {
+	case "off":
+		ac.SubagentModel = ""
+	case "":
+		ac.SubagentModel = DefaultSubagentModel
+	}
 }
