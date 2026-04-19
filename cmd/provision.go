@@ -113,7 +113,7 @@ func runProvision(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  wrote /home/%s/.claude/settings.json\n", osUser)
 
 		// 3aa. Install caveman plugin if enabled (reduces output tokens ~75%)
-		if ac.Caveman {
+		if ac.Caveman.Enabled() {
 			if err := agent.InstallCaveman(osUser); err != nil {
 				fmt.Printf("  warning: caveman install for %s: %v\n", osUser, err)
 			} else {

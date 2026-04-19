@@ -22,6 +22,36 @@ func baseCfg(agentKey string, ac config.AgentConfig) *config.Config {
 	}
 }
 
+func TestGenerate_CavemanInjectsLevel(t *testing.T) {
+	for _, level := range []config.CavemanLevel{config.CavemanLite, config.CavemanFull, config.CavemanUltra} {
+		cfg := baseCfg("lead", config.AgentConfig{
+			Name:      "Lead",
+			Model:     "claude-opus-4-7",
+			Iteration: "1m",
+			Prompt:    "do the thing",
+			Caveman:   level,
+		})
+		out := Generate(cfg, "lead")
+		want := "/caveman " + level.Level()
+		if !strings.Contains(out, want) {
+			t.Errorf("level=%q: expected %q in runner, got:\n%s", level, want, out)
+		}
+	}
+}
+
+func TestGenerate_CavemanOffNoInjection(t *testing.T) {
+	cfg := baseCfg("lead", config.AgentConfig{
+		Name:      "Lead",
+		Model:     "claude-opus-4-7",
+		Iteration: "1m",
+		Prompt:    "do the thing",
+	})
+	out := Generate(cfg, "lead")
+	if strings.Contains(out, "/caveman") {
+		t.Fatalf("expected no /caveman when unset, got:\n%s", out)
+	}
+}
+
 func TestGenerate_SubagentModelExportPresent(t *testing.T) {
 	cfg := baseCfg("lead", config.AgentConfig{
 		Name:          "Lead",
