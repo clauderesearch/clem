@@ -48,6 +48,7 @@ func runProvision(cmd *cobra.Command, args []string) error {
 
 	for agentKey, ac := range cfg.Agents {
 		osUser := cfg.OSUsername(agentKey)
+		homeDir := fmt.Sprintf("/home/%s", osUser)
 		fmt.Printf("\n[%s] %s (%s)\n", agentKey, ac.Name, osUser)
 
 		// 1. Create OS user
@@ -78,10 +79,10 @@ func runProvision(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  warning: could not decrypt secrets for %s: %v\n", agentKey, err)
 			if len(providerEnv) > 0 {
 				// still write provider env so agents can run without vault
-				if err := agent.WriteEnvFile(osUser, providerEnv); err != nil {
+				if err := agent.WriteEnvFile(osUser, homeDir, providerEnv); err != nil {
 					return fmt.Errorf("writing .env for %s: %w", agentKey, err)
 				}
-				fmt.Printf("  wrote /home/%s/.env (provider only, no vault)\n", osUser)
+				fmt.Printf("  wrote %s/.env (provider only, no vault)\n", homeDir)
 			} else {
 				fmt.Println("  skipping .env — run clem vault init and set secrets first")
 			}
@@ -93,13 +94,13 @@ func runProvision(cmd *cobra.Command, args []string) error {
 			for k, v := range providerEnv {
 				merged[k] = v
 			}
-			if err := agent.WriteEnvFile(osUser, merged); err != nil {
+			if err := agent.WriteEnvFile(osUser, homeDir, merged); err != nil {
 				return fmt.Errorf("writing .env for %s: %w", agentKey, err)
 			}
-			fmt.Printf("  wrote /home/%s/.env (%d secrets + %d provider)\n", osUser, len(secrets), len(providerEnv))
+			fmt.Printf("  wrote %s/.env (%d secrets + %d provider)\n", homeDir, len(secrets), len(providerEnv))
 
 			// If wrangler credentials are present, write the wrangler config file
-			if err := agent.WriteWranglerConfig(osUser, secrets); err != nil {
+			if err := agent.WriteWranglerConfig(osUser, homeDir, secrets); err != nil {
 				fmt.Printf("  warning: writing wrangler config: %v\n", err)
 			} else if secrets["WRANGLER_OAUTH_TOKEN"] != "" {
 				fmt.Printf("  wrote wrangler config for %s\n", osUser)
@@ -107,10 +108,10 @@ func runProvision(cmd *cobra.Command, args []string) error {
 		}
 
 		// 3. Write Claude Code settings (skip MCP trust dialog, onboarding)
-		if err := agent.WriteSettings(osUser); err != nil {
+		if err := agent.WriteSettings(osUser, homeDir); err != nil {
 			return fmt.Errorf("writing settings for %s: %w", agentKey, err)
 		}
-		fmt.Printf("  wrote /home/%s/.claude/settings.json\n", osUser)
+		fmt.Printf("  wrote %s/.claude/settings.json\n", homeDir)
 
 		// 3aa. Install caveman plugin if enabled (reduces output tokens ~75%)
 		if ac.Caveman.Enabled() {
@@ -122,7 +123,7 @@ func runProvision(cmd *cobra.Command, args []string) error {
 		}
 
 		// 3a. Generate SSH keypair (idempotent)
-		pubKey, err := agent.EnsureSSHKey(osUser)
+		pubKey, err := agent.EnsureSSHKey(osUser, homeDir)
 		if err != nil {
 			fmt.Printf("  warning: ssh key for %s: %v\n", osUser, err)
 		} else {
@@ -132,7 +133,7 @@ func runProvision(cmd *cobra.Command, args []string) error {
 		// 3b. Install client-side pre-push hook that scans for secret patterns.
 		// Defense-in-depth alongside the existing .gitignore_global + GitHub
 		// Push Protection. Refuses any push whose diff contains credentials.
-		if err := agent.InstallGitHooks(osUser); err != nil {
+		if err := agent.InstallGitHooks(osUser, homeDir); err != nil {
 			return fmt.Errorf("installing git hooks for %s: %w", osUser, err)
 		}
 		fmt.Printf("  installed pre-push secret-scan hook\n")
@@ -141,7 +142,6 @@ func runProvision(cmd *cobra.Command, args []string) error {
 		// MkdirAll as root would leave intermediate parents (.local, .claude)
 		// root-owned, which breaks the runner's log writes and claude's
 		// credential reads. EnsureOwnedDir chowns the full tree.
-		homeDir := fmt.Sprintf("/home/%s", osUser)
 		workDir := filepath.Join(homeDir, cfg.Project)
 		binDir := filepath.Join(homeDir, ".local", "bin")
 		claudeDir := filepath.Join(homeDir, ".claude")

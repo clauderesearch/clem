@@ -1,13 +1,44 @@
 package agent
 
 import (
+	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
+
+// stubExec records invocations and returns canned responses. Replaces sys in tests
+// to avoid requiring root, real OS users, or system binaries.
+type stubExec struct {
+	calls   [][]string
+	failOn  string // if non-empty, return error when command name matches
+	failOut []byte
+}
+
+func (s *stubExec) Run(name string, args ...string) ([]byte, error) {
+	call := append([]string{name}, args...)
+	s.calls = append(s.calls, call)
+	if s.failOn != "" && name == s.failOn {
+		return s.failOut, errors.New("stub: forced failure")
+	}
+	return nil, nil
+}
+
+// withStub replaces the package-level sys executor with stub for the duration
+// of the test, restoring the original on cleanup.
+func withStub(t *testing.T) *stubExec {
+	t.Helper()
+	stub := &stubExec{}
+	orig := sys
+	sys = stub
+	t.Cleanup(func() { sys = orig })
+	return stub
+}
 
 // TestSecretPatternRegex_MatchesKnownCredentials verifies the regex actually
 // matches the secret shapes we claim to detect. Would catch a typo in any
@@ -255,4 +286,194 @@ func writeTestableHook(t *testing.T, stubDiffCmd string) string {
 		t.Fatalf("write hook: %v", err)
 	}
 	return hookPath
+}
+
+// --- Executor seam tests ---
+
+func TestProjectFromUsername(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"myproject-ada", "myproject"},
+		{"clem-dev-ada", "clem-dev"},
+		{"nohyphen", "nohyphen"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		got := projectFromUsername(tc.in)
+		if got != tc.want {
+			t.Errorf("projectFromUsername(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestTokenExpiry_MissingFile(t *testing.T) {
+	dir := t.TempDir()
+	expiry := TokenExpiry(dir)
+	if !expiry.IsZero() {
+		t.Errorf("expected zero time for missing credentials, got %v", expiry)
+	}
+}
+
+func TestTokenExpiry_ValidCredentials(t *testing.T) {
+	dir := t.TempDir()
+	claudeDir := filepath.Join(dir, ".claude")
+	if err := os.MkdirAll(claudeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// expiresAt is milliseconds since epoch
+	wantExpiry := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	ms := wantExpiry.UnixMilli()
+	creds := map[string]any{
+		"claudeAiOauth": map[string]any{"expiresAt": ms},
+	}
+	data, _ := json.Marshal(creds)
+	if err := os.WriteFile(filepath.Join(claudeDir, ".credentials.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	got := TokenExpiry(dir)
+	if !got.Equal(wantExpiry) {
+		t.Errorf("TokenExpiry = %v, want %v", got, wantExpiry)
+	}
+}
+
+func TestNeedsLogin_NoToken(t *testing.T) {
+	dir := t.TempDir()
+	if !NeedsLogin(dir) {
+		t.Error("NeedsLogin should return true when no credentials file exists")
+	}
+}
+
+func TestNeedsLogin_ValidToken(t *testing.T) {
+	dir := t.TempDir()
+	claudeDir := filepath.Join(dir, ".claude")
+	if err := os.MkdirAll(claudeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(30 * 24 * time.Hour)
+	creds := map[string]any{
+		"claudeAiOauth": map[string]any{"expiresAt": future.UnixMilli()},
+	}
+	data, _ := json.Marshal(creds)
+	os.WriteFile(filepath.Join(claudeDir, ".credentials.json"), data, 0600) //nolint:errcheck
+	if NeedsLogin(dir) {
+		t.Error("NeedsLogin should return false when token is valid for 30 days")
+	}
+}
+
+func TestWriteSettings_WritesExpectedFiles(t *testing.T) {
+	stub := withStub(t)
+	dir := t.TempDir()
+	username := "testuser"
+
+	if err := WriteSettings(username, dir); err != nil {
+		t.Fatalf("WriteSettings: %v", err)
+	}
+
+	// settings.json must exist and contain the trust flags
+	settingsData, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatalf("settings.json not written: %v", err)
+	}
+	if !strings.Contains(string(settingsData), "hasTrustDialogAccepted") {
+		t.Errorf("settings.json missing hasTrustDialogAccepted: %s", settingsData)
+	}
+	if !strings.Contains(string(settingsData), `"includeCoAuthoredBy": false`) {
+		t.Errorf("settings.json missing includeCoAuthoredBy=false: %s", settingsData)
+	}
+
+	// .claude.json must exist and contain the project trust entry
+	appStateData, err := os.ReadFile(filepath.Join(dir, ".claude.json"))
+	if err != nil {
+		t.Fatalf(".claude.json not written: %v", err)
+	}
+	if !strings.Contains(string(appStateData), "hasCompletedOnboarding") {
+		t.Errorf(".claude.json missing hasCompletedOnboarding: %s", appStateData)
+	}
+
+	// ChownPath was called (best-effort; stub records it without failing)
+	if len(stub.calls) == 0 {
+		t.Error("expected ChownPath to invoke sys.Run at least once")
+	}
+	_ = stub
+}
+
+func TestEnsureUser_AlreadyExists(t *testing.T) {
+	stub := withStub(t) // "id" returns nil error → user exists
+	if err := EnsureUser("existinguser"); err != nil {
+		t.Fatalf("EnsureUser: %v", err)
+	}
+	// Only "id" should have been called — no "useradd"
+	if len(stub.calls) != 1 || stub.calls[0][0] != "id" {
+		t.Errorf("expected only 'id' call, got %v", stub.calls)
+	}
+}
+
+func TestEnsureUser_CreateNew(t *testing.T) {
+	stub := withStub(t)
+	stub.failOn = "id" // "id" fails → user does not exist → useradd is called
+	if err := EnsureUser("newuser"); err != nil {
+		t.Fatalf("EnsureUser: %v", err)
+	}
+	if len(stub.calls) < 2 {
+		t.Fatalf("expected id + useradd calls, got %v", stub.calls)
+	}
+	if stub.calls[1][0] != "useradd" {
+		t.Errorf("second call should be useradd, got %s", stub.calls[1][0])
+	}
+}
+
+func TestWriteEnvFile_WritesSecretsAndGitignore(t *testing.T) {
+	withStub(t) // stub chown so no root required
+	dir := t.TempDir()
+	secrets := map[string]string{"GH_TOKEN": "gh-test-token", "FOO": "bar"}
+
+	if err := WriteEnvFile("testuser", dir, secrets); err != nil {
+		t.Fatalf("WriteEnvFile: %v", err)
+	}
+
+	envData, err := os.ReadFile(filepath.Join(dir, ".env"))
+	if err != nil {
+		t.Fatalf(".env not written: %v", err)
+	}
+	envStr := string(envData)
+	if !strings.Contains(envStr, "export GH_TOKEN=") {
+		t.Errorf(".env missing GH_TOKEN export: %s", envStr)
+	}
+
+	ignoreData, err := os.ReadFile(filepath.Join(dir, ".gitignore_global"))
+	if err != nil {
+		t.Fatalf(".gitignore_global not written: %v", err)
+	}
+	if !strings.Contains(string(ignoreData), ".env") {
+		t.Errorf(".gitignore_global missing .env entry: %s", ignoreData)
+	}
+}
+
+func TestInstallGitHooks_WritesHookAndConfig(t *testing.T) {
+	withStub(t)
+	dir := t.TempDir()
+
+	if err := InstallGitHooks("testuser", dir); err != nil {
+		t.Fatalf("InstallGitHooks: %v", err)
+	}
+
+	hookPath := filepath.Join(dir, ".config", "git", "hooks", "pre-push")
+	hookData, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("pre-push hook not written: %v", err)
+	}
+	if !strings.HasPrefix(string(hookData), "#!/bin/bash") {
+		t.Errorf("pre-push hook missing shebang: %s", hookData[:20])
+	}
+
+	gitConfigData, err := os.ReadFile(filepath.Join(dir, ".gitconfig"))
+	if err != nil {
+		t.Fatalf(".gitconfig not written: %v", err)
+	}
+	if !strings.Contains(string(gitConfigData), "hooksPath") {
+		t.Errorf(".gitconfig missing hooksPath: %s", gitConfigData)
+	}
 }

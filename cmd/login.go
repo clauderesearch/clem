@@ -32,8 +32,9 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		osUser := cfg.OSUsername(agentKey)
 		fmt.Printf("[%s] %s (%s)\n", agentKey, ac.Name, osUser)
 
-		if !agent.NeedsLogin(osUser) {
-			expiry := agent.TokenExpiry(osUser)
+		homeDir := fmt.Sprintf("/home/%s", osUser)
+		if !agent.NeedsLogin(homeDir) {
+			expiry := agent.TokenExpiry(homeDir)
 			fmt.Printf("  token valid until %s — skipping\n", expiry.Format("2006-01-02"))
 			continue
 		}
