@@ -270,11 +270,16 @@ const DefaultSubagentModel = "claude-sonnet-4-6"
 
 // normalizeSubagentModel applies the default and maps the "off" sentinel to
 // empty string. Called from Load after YAML parse so runner.go stays simple.
+// Default only applies to Anthropic-backed providers (anthropic, bedrock,
+// vertex); ollama and openai-compat cannot use CLAUDE_CODE_SUBAGENT_MODEL.
 func (ac *AgentConfig) normalizeSubagentModel() {
 	switch ac.SubagentModel {
 	case "off":
 		ac.SubagentModel = ""
 	case "":
-		ac.SubagentModel = DefaultSubagentModel
+		switch ac.Provider {
+		case "", "anthropic", "bedrock", "vertex":
+			ac.SubagentModel = DefaultSubagentModel
+		}
 	}
 }

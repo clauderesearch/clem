@@ -196,3 +196,49 @@ func TestLoad_SubagentModelOffDisables(t *testing.T) {
 		t.Errorf("SubagentModel = %q, want empty (disabled)", got)
 	}
 }
+
+func TestLoad_SubagentModelNoDefaultForOllama(t *testing.T) {
+	yaml := `
+project: myteam
+coordination:
+  backend: discord
+  server_id: "1"
+  channels: {general: "g"}
+agents:
+  lead:
+    name: "Lead"
+    model: "llama3"
+    provider: ollama
+`
+	path := writeYAML(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Agents["lead"].SubagentModel; got != "" {
+		t.Errorf("SubagentModel = %q, want empty (ollama cannot use CLAUDE_CODE_SUBAGENT_MODEL)", got)
+	}
+}
+
+func TestLoad_SubagentModelDefaultsForBedrock(t *testing.T) {
+	yaml := `
+project: myteam
+coordination:
+  backend: discord
+  server_id: "1"
+  channels: {general: "g"}
+agents:
+  lead:
+    name: "Lead"
+    model: "claude-opus-4-7"
+    provider: bedrock
+`
+	path := writeYAML(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Agents["lead"].SubagentModel; got != DefaultSubagentModel {
+		t.Errorf("SubagentModel = %q, want %q (bedrock is Anthropic-backed)", got, DefaultSubagentModel)
+	}
+}
