@@ -74,7 +74,7 @@ ARG SAMPLE=anthropic
 WORKDIR /srv/team
 COPY samples/${SAMPLE}/clem.yaml ./clem.yaml
 
-# Default: interactive shell. To boot systemd instead (so `clem provision`
-# can start services), run with `--entrypoint /sbin/init --privileged`.
-# See samples/<sample>/README.md for full instructions.
-CMD ["/bin/bash"]
+# Boot systemd so `clem provision` can install and start services.
+# Run with: podman run -d --systemd=always <image>
+# For an interactive shell instead: docker run -it --entrypoint /bin/bash <image>
+CMD ["/sbin/init"]
