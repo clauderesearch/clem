@@ -47,6 +47,10 @@ func loadConfig(cmd *cobra.Command, args []string) error {
 	if cmd.Name() == "init" {
 		return nil
 	}
+	// update is a binary-management command; no project config needed
+	if cmd.Name() == "update" {
+		return nil
+	}
 
 	var err error
 	cfg, err = config.Load(configPath)
