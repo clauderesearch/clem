@@ -103,6 +103,13 @@ type AgentConfig struct {
 	// than the main session. Accepts model aliases (sonnet, haiku, opus) or
 	// full IDs (claude-sonnet-4-6). Empty = inherit main model.
 	SubagentModel string `yaml:"subagent_model"`
+	// GitName and GitEmail set the agent's git user identity during provision.
+	// Without these, commits are authored with whatever identity the OAuth login
+	// stored, which may leak the operator's personal email into public history.
+	// If GitEmail is unset and the agent's vault contains GH_TOKEN, provision
+	// logs a warning at runtime.
+	GitName  string `yaml:"git_name"`
+	GitEmail string `yaml:"git_email"`
 }
 
 // RuntimeKind returns the normalized runtime name for this agent.

@@ -593,7 +593,7 @@ func TestConfigureGit_WritesSigningConfig(t *testing.T) {
 	username := "testuser"
 	pubKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestPubKeyData testuser@clem"
 
-	if err := ConfigureGit(username, dir, pubKey); err != nil {
+	if err := ConfigureGit(username, dir, pubKey, "", ""); err != nil {
 		t.Fatalf("ConfigureGit: %v", err)
 	}
 
@@ -621,22 +621,75 @@ func TestConfigureGit_WritesSigningConfig(t *testing.T) {
 	}
 }
 
+func TestConfigureGit_WritesUserIdentity(t *testing.T) {
+	withStub(t)
+	dir := t.TempDir()
+	pubKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestPubKeyData testuser@clem"
+
+	if err := ConfigureGit("testuser", dir, pubKey, "clauderesearch", "212849679+clauderesearch@users.noreply.github.com"); err != nil {
+		t.Fatalf("ConfigureGit: %v", err)
+	}
+
+	gcData, err := os.ReadFile(filepath.Join(dir, ".gitconfig"))
+	if err != nil {
+		t.Fatalf(".gitconfig not written: %v", err)
+	}
+	gcStr := string(gcData)
+	if !strings.Contains(gcStr, "\tname = clauderesearch") {
+		t.Errorf(".gitconfig missing name: %s", gcStr)
+	}
+	if !strings.Contains(gcStr, "\temail = 212849679+clauderesearch@users.noreply.github.com") {
+		t.Errorf(".gitconfig missing email: %s", gcStr)
+	}
+}
+
+func TestConfigureGit_PreservesExistingIdentity(t *testing.T) {
+	withStub(t)
+	dir := t.TempDir()
+	pubKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestPubKeyData testuser@clem"
+
+	// pre-existing operator-set identity
+	existing := "[user]\n\tname = operator\n\temail = operator@example.com\n"
+	if err := os.WriteFile(filepath.Join(dir, ".gitconfig"), []byte(existing), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ConfigureGit("testuser", dir, pubKey, "clauderesearch", "bot@example.com"); err != nil {
+		t.Fatalf("ConfigureGit: %v", err)
+	}
+
+	gcData, _ := os.ReadFile(filepath.Join(dir, ".gitconfig"))
+	gcStr := string(gcData)
+	if strings.Contains(gcStr, "clauderesearch") {
+		t.Errorf("ConfigureGit overwrote operator name: %s", gcStr)
+	}
+	if strings.Contains(gcStr, "bot@example.com") {
+		t.Errorf("ConfigureGit overwrote operator email: %s", gcStr)
+	}
+}
+
 func TestConfigureGit_Idempotent(t *testing.T) {
 	withStub(t)
 	dir := t.TempDir()
 	pubKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestPubKeyData testuser@clem"
 
-	if err := ConfigureGit("testuser", dir, pubKey); err != nil {
+	if err := ConfigureGit("testuser", dir, pubKey, "ada", "ada@clem.local"); err != nil {
 		t.Fatalf("first call: %v", err)
 	}
-	if err := ConfigureGit("testuser", dir, pubKey); err != nil {
+	if err := ConfigureGit("testuser", dir, pubKey, "ada", "ada@clem.local"); err != nil {
 		t.Fatalf("second call: %v", err)
 	}
 
 	gcData, _ := os.ReadFile(filepath.Join(dir, ".gitconfig"))
-	count := strings.Count(string(gcData), "gpgsign")
-	if count != 1 {
-		t.Errorf("expected gpgsign once in .gitconfig, got %d: %s", count, gcData)
+	gcStr := string(gcData)
+	if count := strings.Count(gcStr, "gpgsign"); count != 1 {
+		t.Errorf("expected gpgsign once in .gitconfig, got %d: %s", count, gcStr)
+	}
+	if count := strings.Count(gcStr, "\tname = ada"); count != 1 {
+		t.Errorf("expected name once in .gitconfig, got %d: %s", count, gcStr)
+	}
+	if count := strings.Count(gcStr, "\temail = ada@clem.local"); count != 1 {
+		t.Errorf("expected email once in .gitconfig, got %d: %s", count, gcStr)
 	}
 }
 
