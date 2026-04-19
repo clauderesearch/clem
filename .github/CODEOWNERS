@@ -1,0 +1,4 @@
+# Every file in this repo requires review from @jahwag before merge to main.
+# Matches the "require_code_owner_review" rule in the "master rule" ruleset.
+# Keep this list tight — adding owners widens who can approve PRs on main.
+* @jahwag
