@@ -182,6 +182,45 @@ done
 exit 0
 `, SecretPatternRegex, SecretCodePatternRegex)
 
+// ConfigureGit writes SSH commit-signing configuration to the agent's
+// ~/.gitconfig and creates ~/.ssh/allowed_signers so git can verify signatures
+// locally. Idempotent — safe to call every provision.
+// pubKey is the agent's ed25519 public key (returned by EnsureSSHKey).
+func ConfigureGit(username, homeDir, pubKey string) error {
+	sshDir := filepath.Join(homeDir, ".ssh")
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		return fmt.Errorf("creating .ssh dir: %w", err)
+	}
+
+	commitEmail := username + "@clem"
+	allowedSignersPath := filepath.Join(sshDir, "allowed_signers")
+	if err := os.WriteFile(allowedSignersPath, []byte(commitEmail+" "+pubKey+"\n"), 0644); err != nil {
+		return fmt.Errorf("writing allowed_signers: %w", err)
+	}
+	if err := chownToUser(allowedSignersPath, username); err != nil {
+		return fmt.Errorf("chowning allowed_signers: %w", err)
+	}
+
+	gitConfigPath := filepath.Join(homeDir, ".gitconfig")
+	existing, _ := os.ReadFile(gitConfigPath)
+	if !strings.Contains(string(existing), "gpgsign") {
+		signingKey := filepath.Join(sshDir, "id_ed25519.pub")
+		block := fmt.Sprintf(
+			"\n[user]\n\tsigningkey = %s\n[commit]\n\tgpgsign = true\n[gpg]\n\tformat = ssh\n[gpg \"ssh\"]\n\tallowedSignersFile = %s\n",
+			signingKey,
+			allowedSignersPath,
+		)
+		appended := string(existing) + block
+		if err := os.WriteFile(gitConfigPath, []byte(appended), 0644); err != nil {
+			return fmt.Errorf("writing %s: %w", gitConfigPath, err)
+		}
+		if err := chownToUser(gitConfigPath, username); err != nil {
+			return fmt.Errorf("chowning %s: %w", gitConfigPath, err)
+		}
+	}
+	return nil
+}
+
 // InstallGitHooks writes a global pre-push hook for the agent user and points
 // their git config at it via core.hooksPath. Idempotent - safe to call every
 // provision. The hook rejects pushes whose diff contains credential patterns,
