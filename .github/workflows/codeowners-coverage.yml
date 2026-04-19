@@ -1,0 +1,65 @@
+name: codeowners-coverage
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  codeowners-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify all tracked files have a CODEOWNER
+        run: |
+          pip install pathspec --quiet
+          python3 - <<'EOF'
+          import subprocess
+          import sys
+
+          try:
+              import pathspec
+          except ImportError:
+              print("ERROR: pathspec not available")
+              sys.exit(1)
+
+          codeowners = ".github/CODEOWNERS"
+          try:
+              with open(codeowners) as f:
+                  lines = f.readlines()
+          except FileNotFoundError:
+              print(f"ERROR: {codeowners} not found")
+              sys.exit(1)
+
+          patterns = []
+          for line in lines:
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              parts = line.split()
+              if parts:
+                  patterns.append(parts[0])
+
+          if not patterns:
+              print("ERROR: CODEOWNERS has no patterns — all files would be orphaned")
+              sys.exit(1)
+
+          spec = pathspec.PathSpec.from_lines("gitwildmatch", patterns)
+
+          result = subprocess.run(
+              ["git", "ls-files"], capture_output=True, text=True, check=True
+          )
+          tracked = [f for f in result.stdout.strip().splitlines() if f]
+
+          orphans = [f for f in tracked if not spec.match_file(f)]
+
+          if orphans:
+              print("Files with no CODEOWNER:")
+              for f in sorted(orphans):
+                  print(f"  {f}")
+              sys.exit(1)
+
+          print(f"OK: all {len(tracked)} tracked files have a CODEOWNER.")
+          EOF
