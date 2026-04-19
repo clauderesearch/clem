@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -68,15 +69,21 @@ id_rsa
 	if err := os.WriteFile(globalIgnore, []byte(ignoreContent), 0644); err != nil {
 		return fmt.Errorf("writing gitignore_global: %w", err)
 	}
-	exec.Command("chown", fmt.Sprintf("%s:%s", username, username), globalIgnore).Run()
+	if err := exec.Command("chown", fmt.Sprintf("%s:%s", username, username), globalIgnore).Run(); err != nil {
+		log.Printf("warning: chown %s: %v", globalIgnore, err)
+	}
 
 	// Write/update ~/.gitconfig directly to avoid sudo subshell quoting issues
 	gitConfigPath := filepath.Join(homeDir, ".gitconfig")
 	existing, _ := os.ReadFile(gitConfigPath)
 	if !strings.Contains(string(existing), "excludesfile") {
 		appended := string(existing) + fmt.Sprintf("\n[core]\n\texcludesfile = %s\n", globalIgnore)
-		os.WriteFile(gitConfigPath, []byte(appended), 0644)
-		exec.Command("chown", fmt.Sprintf("%s:%s", username, username), gitConfigPath).Run()
+		if err := os.WriteFile(gitConfigPath, []byte(appended), 0644); err != nil {
+			return fmt.Errorf("writing gitconfig: %w", err)
+		}
+		if err := exec.Command("chown", fmt.Sprintf("%s:%s", username, username), gitConfigPath).Run(); err != nil {
+			log.Printf("warning: chown %s: %v", gitConfigPath, err)
+		}
 	}
 
 	return nil
@@ -123,8 +130,12 @@ func EnsureSSHKey(username string) (string, error) {
 	if err := os.MkdirAll(sshDir, 0700); err != nil {
 		return "", fmt.Errorf("creating .ssh dir: %w", err)
 	}
-	exec.Command("chown", username+":"+username, sshDir).Run()
-	exec.Command("chmod", "700", sshDir).Run()
+	if err := exec.Command("chown", username+":"+username, sshDir).Run(); err != nil {
+		log.Printf("warning: chown %s: %v", sshDir, err)
+	}
+	if err := exec.Command("chmod", "700", sshDir).Run(); err != nil {
+		log.Printf("warning: chmod 700 %s: %v", sshDir, err)
+	}
 
 	if _, err := os.Stat(keyPath); err == nil {
 		// Already exists; return the existing public key
