@@ -297,8 +297,8 @@ func Generate(cfg *config.Config, agentKey string) string {
 	iterSec := int(iterDur.Seconds())
 
 	promptText := ac.Prompt
-	if ac.Caveman {
-		promptText = "/caveman ultra\n" + promptText
+	if ac.Caveman.Enabled() {
+		promptText = "/caveman " + ac.Caveman.Level() + "\n" + promptText
 	}
 	// Interactive TUIs (claude-code, opencode) do not exit after completing a
 	// prompt — they wait for the next tmux-injected input. The runner loop

@@ -290,7 +290,7 @@ agents:
     vaults: [string]        # vault names merged into .env (later vaults win)
     prompt: string          # injected at start of each session
     web_terminal_port: int  # optional - ttyd port (1024-65535) for read-only viewing
-    caveman: bool           # optional - install caveman plugin (compresses output ~75%)
+    caveman: off|lite|full|ultra  # optional - install caveman plugin (compresses output ~75%); true → ultra (legacy compat)
     subagent_model: string  # optional - CLAUDE_CODE_SUBAGENT_MODEL for Task tool / Explore / general-purpose
     provider: string        # optional - anthropic (default) | bedrock | vertex | ollama | openai-compat
     provider_url: string    # required when provider is ollama or openai-compat

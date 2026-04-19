@@ -13,6 +13,54 @@ import (
 
 var validName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
 
+// CavemanLevel controls whether and at what intensity the caveman plugin is
+// injected. Accepts "off"/""  (disabled), "lite", "full", "ultra", or the
+// legacy boolean true (→ "ultra") / false (→ "off").
+type CavemanLevel string
+
+const (
+	CavemanOff   CavemanLevel = ""
+	CavemanLite  CavemanLevel = "lite"
+	CavemanFull  CavemanLevel = "full"
+	CavemanUltra CavemanLevel = "ultra"
+)
+
+// Enabled reports whether the caveman plugin should be installed and injected.
+func (cl CavemanLevel) Enabled() bool { return cl != CavemanOff }
+
+// Level returns the intensity string ("lite", "full", "ultra").
+// Callers should check Enabled() first.
+func (cl CavemanLevel) Level() string { return string(cl) }
+
+// UnmarshalYAML accepts string levels, "off", and legacy booleans.
+func (cl *CavemanLevel) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Tag {
+	case "!!bool":
+		if value.Value == "true" {
+			*cl = CavemanUltra
+		} else {
+			*cl = CavemanOff
+		}
+		return nil
+	case "!!str", "!!null":
+		switch value.Value {
+		case "", "off", "null":
+			*cl = CavemanOff
+		case "lite":
+			*cl = CavemanLite
+		case "full":
+			*cl = CavemanFull
+		case "ultra":
+			*cl = CavemanUltra
+		default:
+			return fmt.Errorf("invalid caveman value %q (valid: off, lite, full, ultra)", value.Value)
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid caveman value %q (valid: off, lite, full, ultra)", value.Value)
+	}
+}
+
 type Config struct {
 	Project          string                 `yaml:"project"`
 	PrimaryMilestone string                 `yaml:"primary_milestone"`
@@ -41,7 +89,7 @@ type AgentConfig struct {
 	// 127.0.0.1 for safety (expects SSH tunnel or reverse proxy). Use
 	// 0.0.0.0 when running inside a container with host port-forward.
 	WebTerminalBind string `yaml:"web_terminal_bind"`
-	Caveman         bool   `yaml:"caveman"`
+	Caveman         CavemanLevel `yaml:"caveman"`
 	// Runtime selects which CLI drives the agent's session. Default is
 	// claude-code. opencode talks to 75+ providers (including Ollama) via
 	// models.dev without the Anthropic-format translator in the middle.

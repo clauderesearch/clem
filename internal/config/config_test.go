@@ -15,6 +15,94 @@ func writeYAML(t *testing.T, content string) string {
 	return path
 }
 
+func minYAML(caveman string) string {
+	cavemanLine := ""
+	if caveman != "" {
+		cavemanLine = "\n    caveman: " + caveman
+	}
+	return `
+project: myteam
+coordination:
+  backend: discord
+  server_id: "1"
+  channels: {general: "g"}
+agents:
+  lead:
+    name: "Lead"
+    model: "claude-sonnet-4-6"` + cavemanLine + "\n"
+}
+
+func TestCavemanLevel_StringLevels(t *testing.T) {
+	cases := []struct {
+		yaml    string
+		want    CavemanLevel
+		enabled bool
+	}{
+		{"lite", CavemanLite, true},
+		{"full", CavemanFull, true},
+		{"ultra", CavemanUltra, true},
+		{"off", CavemanOff, false},
+	}
+	for _, tc := range cases {
+		path := writeYAML(t, minYAML(tc.yaml))
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("caveman=%q: Load: %v", tc.yaml, err)
+		}
+		got := cfg.Agents["lead"].Caveman
+		if got != tc.want {
+			t.Errorf("caveman=%q: got %q, want %q", tc.yaml, got, tc.want)
+		}
+		if got.Enabled() != tc.enabled {
+			t.Errorf("caveman=%q: Enabled()=%v, want %v", tc.yaml, got.Enabled(), tc.enabled)
+		}
+		if tc.enabled && got.Level() != tc.yaml {
+			t.Errorf("caveman=%q: Level()=%q, want %q", tc.yaml, got.Level(), tc.yaml)
+		}
+	}
+}
+
+func TestCavemanLevel_LegacyBool(t *testing.T) {
+	// true → ultra
+	path := writeYAML(t, minYAML("true"))
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("caveman=true: Load: %v", err)
+	}
+	if got := cfg.Agents["lead"].Caveman; got != CavemanUltra {
+		t.Errorf("caveman=true: got %q, want %q", got, CavemanUltra)
+	}
+
+	// false → off
+	path = writeYAML(t, minYAML("false"))
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("caveman=false: Load: %v", err)
+	}
+	if got := cfg.Agents["lead"].Caveman; got != CavemanOff {
+		t.Errorf("caveman=false: got %q, want %q", got, CavemanOff)
+	}
+}
+
+func TestCavemanLevel_UnsetIsOff(t *testing.T) {
+	path := writeYAML(t, minYAML(""))
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Agents["lead"].Caveman.Enabled() {
+		t.Error("expected caveman disabled when unset")
+	}
+}
+
+func TestCavemanLevel_InvalidStringRejectsAtLoad(t *testing.T) {
+	path := writeYAML(t, minYAML("maximum"))
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for invalid caveman value, got nil")
+	}
+}
+
 func TestLoad_PrimaryMilestoneParsed(t *testing.T) {
 	path := writeYAML(t, `
 project: myteam
