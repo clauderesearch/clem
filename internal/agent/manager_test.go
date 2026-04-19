@@ -452,6 +452,59 @@ func TestWriteEnvFile_WritesSecretsAndGitignore(t *testing.T) {
 	}
 }
 
+func TestConfigureGit_WritesSigningConfig(t *testing.T) {
+	withStub(t)
+	dir := t.TempDir()
+	username := "testuser"
+	pubKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestPubKeyData testuser@clem"
+
+	if err := ConfigureGit(username, dir, pubKey); err != nil {
+		t.Fatalf("ConfigureGit: %v", err)
+	}
+
+	asData, err := os.ReadFile(filepath.Join(dir, ".ssh", "allowed_signers"))
+	if err != nil {
+		t.Fatalf("allowed_signers not written: %v", err)
+	}
+	asStr := string(asData)
+	if !strings.Contains(asStr, username+"@clem") {
+		t.Errorf("allowed_signers missing commit email: %s", asStr)
+	}
+	if !strings.Contains(asStr, pubKey) {
+		t.Errorf("allowed_signers missing pubkey: %s", asStr)
+	}
+
+	gcData, err := os.ReadFile(filepath.Join(dir, ".gitconfig"))
+	if err != nil {
+		t.Fatalf(".gitconfig not written: %v", err)
+	}
+	gcStr := string(gcData)
+	for _, want := range []string{"gpgsign = true", "format = ssh", "allowedSignersFile", "signingkey"} {
+		if !strings.Contains(gcStr, want) {
+			t.Errorf(".gitconfig missing %q: %s", want, gcStr)
+		}
+	}
+}
+
+func TestConfigureGit_Idempotent(t *testing.T) {
+	withStub(t)
+	dir := t.TempDir()
+	pubKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestPubKeyData testuser@clem"
+
+	if err := ConfigureGit("testuser", dir, pubKey); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	if err := ConfigureGit("testuser", dir, pubKey); err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+
+	gcData, _ := os.ReadFile(filepath.Join(dir, ".gitconfig"))
+	count := strings.Count(string(gcData), "gpgsign")
+	if count != 1 {
+		t.Errorf("expected gpgsign once in .gitconfig, got %d: %s", count, gcData)
+	}
+}
+
 func TestInstallGitHooks_WritesHookAndConfig(t *testing.T) {
 	withStub(t)
 	dir := t.TempDir()

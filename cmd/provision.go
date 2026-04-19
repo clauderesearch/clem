@@ -130,7 +130,16 @@ func runProvision(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  ssh pubkey: %s\n", pubKey)
 		}
 
-		// 3b. Install client-side pre-push hook that scans for secret patterns.
+		// 3b. Configure git commit signing via the agent's SSH key.
+		if pubKey != "" {
+			if err := agent.ConfigureGit(osUser, homeDir, pubKey); err != nil {
+				fmt.Printf("  warning: git signing config for %s: %v\n", osUser, err)
+			} else {
+				fmt.Printf("  configured git commit signing for %s\n", osUser)
+			}
+		}
+
+		// 3c. Install client-side pre-push hook that scans for secret patterns.
 		// Defense-in-depth alongside the existing .gitignore_global + GitHub
 		// Push Protection. Refuses any push whose diff contains credentials.
 		if err := agent.InstallGitHooks(osUser, homeDir); err != nil {
