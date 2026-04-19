@@ -4,8 +4,9 @@ Self-contained Dockerised setup for trying clem without touching your host.
 
 Samples today:
 
-- [`ollama-nemotron-4b/`](ollama-nemotron-4b/) - **Discord** coordination + local [NVIDIA Nemotron 3 Nano 4B](https://ollama.com/library/nemotron-3-nano) via Ollama. 2.8 GB, fits an 8 GB MacBook Air, emits proper tool_use blocks.
-- [`slack-nemotron-4b/`](slack-nemotron-4b/) - **Slack** coordination, same local model. Uses [korotovsky/slack-mcp-server](https://github.com/korotovsky/slack-mcp-server).
+- [`anthropic/`](anthropic/) - **Discord** coordination + [Anthropic Claude API](https://www.anthropic.com/). Bring your own API key; no local GPU needed. Published as `ghcr.io/jahwag/clem-sample:latest`.
+- [`ollama-nemotron-4b/`](ollama-nemotron-4b/) - **Discord** coordination + local [NVIDIA Nemotron 3 Nano 4B](https://ollama.com/library/nemotron-3-nano) via Ollama. 2.8 GB, fits an 8 GB MacBook Air, emits proper tool_use blocks. Published as `ghcr.io/jahwag/clem-sample:latest-ollama`.
+- [`slack-nemotron-4b/`](slack-nemotron-4b/) - **Slack** coordination, same local model. Uses [korotovsky/slack-mcp-server](https://github.com/korotovsky/slack-mcp-server). Published as `ghcr.io/jahwag/clem-sample:latest-slack`.
 
 ## Quick start (prebuilt image)
 
