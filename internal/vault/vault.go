@@ -30,12 +30,17 @@ func Init() error {
 		return fmt.Errorf("age-keygen not found — install age: https://github.com/FiloSottile/age")
 	}
 
-	out, err := exec.Command("age-keygen", "-o", keysPath).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("age-keygen: %w\n%s", err, out)
+	if _, err := os.Stat(keysPath); os.IsNotExist(err) {
+		out, err := exec.Command("age-keygen", "-o", keysPath).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("age-keygen: %w\n%s", err, out)
+		}
+		fmt.Printf("Age keypair generated at: %s\n", keysPath)
+	} else {
+		fmt.Printf("Age key already exists at %s — reusing.\n", keysPath)
 	}
 
-	// Extract public key from the generated file
+	// Extract public key from the generated or existing file
 	data, err := os.ReadFile(keysPath)
 	if err != nil {
 		return fmt.Errorf("reading keys file: %w", err)
@@ -49,7 +54,6 @@ func Init() error {
 		}
 	}
 
-	fmt.Printf("Age keypair generated at: %s\n", keysPath)
 	fmt.Printf("Public key: %s\n", pubKey)
 
 	// Write .sops.yaml if it doesn't already exist

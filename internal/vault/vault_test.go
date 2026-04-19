@@ -144,3 +144,83 @@ func TestSet_RejectsMalformedKeyval(t *testing.T) {
 		t.Errorf("expected error to mention 'KEY=value', got: %v", err)
 	}
 }
+
+// requireAgeKeygen skips if age-keygen is not on PATH.
+func requireAgeKeygen(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("age-keygen"); err != nil {
+		t.Skip("age-keygen not on PATH — skipping integration test")
+	}
+}
+
+func TestInit_FreshInit(t *testing.T) {
+	requireAgeKeygen(t)
+
+	tmpHome := t.TempDir()
+	tmpDir := t.TempDir()
+
+	prevHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpHome)
+	defer os.Setenv("HOME", prevHome)
+
+	prevCwd, _ := os.Getwd()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	defer func() { _ = os.Chdir(prevCwd) }()
+
+	if err := Init(); err != nil {
+		t.Fatalf("Init fresh: %v", err)
+	}
+
+	keysPath := filepath.Join(tmpHome, defaultAgeKeysPath)
+	if _, err := os.Stat(keysPath); err != nil {
+		t.Errorf("keys.txt not created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, ".sops.yaml")); err != nil {
+		t.Errorf(".sops.yaml not created: %v", err)
+	}
+}
+
+func TestInit_ReuseExistingKey(t *testing.T) {
+	requireAgeKeygen(t)
+
+	tmpHome := t.TempDir()
+	tmpDir := t.TempDir()
+
+	keysPath := filepath.Join(tmpHome, defaultAgeKeysPath)
+	if err := os.MkdirAll(filepath.Dir(keysPath), 0700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	out, err := exec.Command("age-keygen", "-o", keysPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("age-keygen setup: %v\n%s", err, out)
+	}
+
+	data, _ := os.ReadFile(keysPath)
+	originalContent := string(data)
+
+	prevHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpHome)
+	defer os.Setenv("HOME", prevHome)
+
+	prevCwd, _ := os.Getwd()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	defer func() { _ = os.Chdir(prevCwd) }()
+
+	if err := Init(); err != nil {
+		t.Fatalf("Init reuse: %v", err)
+	}
+
+	// Key file must be unchanged — age-keygen was not re-run.
+	after, _ := os.ReadFile(keysPath)
+	if string(after) != originalContent {
+		t.Error("keys.txt was overwritten; Init should reuse existing key")
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, ".sops.yaml")); err != nil {
+		t.Errorf(".sops.yaml not created: %v", err)
+	}
+}
