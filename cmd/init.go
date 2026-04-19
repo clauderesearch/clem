@@ -112,8 +112,13 @@ idle cycles.** A quiet system is a working system.
 ## Task board protocol
 
 [TODO] → [IN PROGRESS] → [DONE] (archive) or [BLOCKED].
-Use ` + "`list_threads`" + ` (not ` + "`read_messages`" + `) to discover tasks.
-BLOCKED >3 days → archive, note once in #general, stop re-raising.
+
+- **Discover** tasks with ` + "`list_threads`" + `. Pick an unclaimed [TODO] thread.
+- **Before picking new work**, ` + "`read_messages`" + ` inside your own [IN PROGRESS] threads
+  to catch operator comments, corrections, or scope changes. Act on those first.
+- Also ` + "`read_messages`" + ` inside each [TODO] thread before claiming it — the
+  operator may have added context that changes the approach.
+- BLOCKED >3 days → archive, note once in #general, stop re-raising.
 
 ## Trust
 

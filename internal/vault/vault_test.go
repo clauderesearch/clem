@@ -1,0 +1,146 @@
+package vault
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// requireSopsAndAge skips the test if sops or age-keygen are not on PATH.
+// The bootstrap path shells out to both, so there's no faithful way to
+// unit-test Set without them installed.
+func requireSopsAndAge(t *testing.T) {
+	t.Helper()
+	for _, bin := range []string{"sops", "age-keygen"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not on PATH — skipping integration test", bin)
+		}
+	}
+}
+
+// setupVaultDir creates a temp dir with a fresh age keypair and a
+// .sops.yaml pointing at it, then chdirs there. Returns a cleanup func.
+func setupVaultDir(t *testing.T) func() {
+	t.Helper()
+
+	dir := t.TempDir()
+	keysPath := filepath.Join(dir, "keys.txt")
+
+	out, err := exec.Command("age-keygen", "-o", keysPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("age-keygen: %v\n%s", err, out)
+	}
+
+	data, err := os.ReadFile(keysPath)
+	if err != nil {
+		t.Fatalf("reading keys: %v", err)
+	}
+	pubKey := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "# public key:") {
+			pubKey = strings.TrimSpace(strings.TrimPrefix(line, "# public key:"))
+			break
+		}
+	}
+	if pubKey == "" {
+		t.Fatalf("no public key in %s", keysPath)
+	}
+
+	sopsCfg := "creation_rules:\n  - path_regex: secrets\\.sops\\.yaml\n    age: " + pubKey + "\n"
+	if err := os.WriteFile(filepath.Join(dir, ".sops.yaml"), []byte(sopsCfg), 0644); err != nil {
+		t.Fatalf("write .sops.yaml: %v", err)
+	}
+
+	prevCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	prevKey := os.Getenv("SOPS_AGE_KEY_FILE")
+	os.Setenv("SOPS_AGE_KEY_FILE", keysPath)
+
+	return func() {
+		_ = os.Chdir(prevCwd)
+		if prevKey == "" {
+			os.Unsetenv("SOPS_AGE_KEY_FILE")
+		} else {
+			os.Setenv("SOPS_AGE_KEY_FILE", prevKey)
+		}
+	}
+}
+
+func TestSet_BootstrapsMissingFile(t *testing.T) {
+	requireSopsAndAge(t)
+	cleanup := setupVaultDir(t)
+	defer cleanup()
+
+	if _, err := os.Stat(secretsFile); !os.IsNotExist(err) {
+		t.Fatalf("expected %s to not exist before Set", secretsFile)
+	}
+
+	if err := Set("clementine", "DISCORD_TOKEN=abc123"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	data, err := os.ReadFile(secretsFile)
+	if err != nil {
+		t.Fatalf("secrets file not created: %v", err)
+	}
+
+	content := string(data)
+	if !strings.Contains(content, "clementine:") {
+		t.Errorf("expected 'clementine:' key in encrypted file, got:\n%s", content)
+	}
+	if !strings.Contains(content, "DISCORD_TOKEN:") {
+		t.Errorf("expected 'DISCORD_TOKEN:' in encrypted file, got:\n%s", content)
+	}
+	if strings.Contains(content, "abc123") {
+		t.Errorf("plaintext value leaked into encrypted file:\n%s", content)
+	}
+	if !strings.Contains(content, "ENC[") {
+		t.Errorf("expected sops ENC[...] markers in encrypted file, got:\n%s", content)
+	}
+}
+
+func TestSet_AddsKeyToExistingFile(t *testing.T) {
+	requireSopsAndAge(t)
+	cleanup := setupVaultDir(t)
+	defer cleanup()
+
+	if err := Set("v1", "A=1"); err != nil {
+		t.Fatalf("first Set: %v", err)
+	}
+	if err := Set("v1", "B=2"); err != nil {
+		t.Fatalf("second Set: %v", err)
+	}
+
+	out, err := exec.Command("sops", "-d", secretsFile).CombinedOutput()
+	if err != nil {
+		t.Fatalf("sops -d: %v\n%s", err, out)
+	}
+	plain := string(out)
+	if !strings.Contains(plain, "A: \"1\"") && !strings.Contains(plain, "A: '1'") && !strings.Contains(plain, "A: 1") {
+		t.Errorf("expected A=1 after decrypt, got:\n%s", plain)
+	}
+	if !strings.Contains(plain, "B: \"2\"") && !strings.Contains(plain, "B: '2'") && !strings.Contains(plain, "B: 2") {
+		t.Errorf("expected B=2 after decrypt, got:\n%s", plain)
+	}
+}
+
+func TestSet_RejectsMalformedKeyval(t *testing.T) {
+	cleanup := setupVaultDir(t)
+	defer cleanup()
+
+	err := Set("v1", "no-equals-sign")
+	if err == nil {
+		t.Fatal("expected error for missing =, got nil")
+	}
+	if !strings.Contains(err.Error(), "KEY=value") {
+		t.Errorf("expected error to mention 'KEY=value', got: %v", err)
+	}
+}

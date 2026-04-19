@@ -1,4 +1,5 @@
 .idea
+.claude/
 clem
 *.log
 opus-4-7-suggested-improvements.md
