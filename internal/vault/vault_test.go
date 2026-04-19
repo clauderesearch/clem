@@ -167,7 +167,7 @@ func TestInit_FreshInit(t *testing.T) {
 	if err := os.Chdir(tmpDir); err != nil {
 		t.Fatalf("chdir: %v", err)
 	}
-	defer os.Chdir(prevCwd)
+	defer func() { _ = os.Chdir(prevCwd) }()
 
 	if err := Init(); err != nil {
 		t.Fatalf("Init fresh: %v", err)
@@ -209,7 +209,7 @@ func TestInit_ReuseExistingKey(t *testing.T) {
 	if err := os.Chdir(tmpDir); err != nil {
 		t.Fatalf("chdir: %v", err)
 	}
-	defer os.Chdir(prevCwd)
+	defer func() { _ = os.Chdir(prevCwd) }()
 
 	if err := Init(); err != nil {
 		t.Fatalf("Init reuse: %v", err)
