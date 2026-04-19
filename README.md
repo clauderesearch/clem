@@ -4,6 +4,8 @@
 
 <h1 align="center">clem</h1>
 
+<p align="center"><em>Continuously Looping Engineering Machines.</em></p>
+
 <p align="center"><em><b>docker-compose for Claude Code agents.</b></em></p>
 
 <p align="center">
