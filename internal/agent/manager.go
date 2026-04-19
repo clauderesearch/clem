@@ -12,32 +12,47 @@ import (
 	"github.com/jahwag/clem/internal/config"
 )
 
+// Executor runs a system command and returns its combined output.
+// The package-level sys variable holds the production implementation;
+// tests may replace it with a stub to avoid requiring root or real binaries.
+type Executor interface {
+	Run(name string, args ...string) ([]byte, error)
+}
+
+// OSExecutor is the production Executor backed by exec.Command.
+type OSExecutor struct{}
+
+// Run executes name with args and returns combined stdout+stderr.
+func (OSExecutor) Run(name string, args ...string) ([]byte, error) {
+	return exec.Command(name, args...).CombinedOutput()
+}
+
+// sys is the active Executor. Replaced in tests to avoid root/binary requirements.
+var sys Executor = OSExecutor{}
+
 // EnsureUser creates the OS user if it doesn't already exist.
 func EnsureUser(username string) error {
-	// Check if user exists
-	cmd := exec.Command("id", username)
-	if cmd.Run() == nil {
+	if _, err := sys.Run("id", username); err == nil {
 		fmt.Printf("  user %s already exists\n", username)
 		return nil
 	}
 	fmt.Printf("  creating user %s\n", username)
-	out, err := exec.Command("useradd",
+	out, err := sys.Run("useradd",
 		"--create-home",
 		"--shell", "/bin/bash",
 		"--comment", "clem managed agent",
 		username,
-	).CombinedOutput()
+	)
 	if err != nil {
 		return fmt.Errorf("useradd %s: %w\n%s", username, err, out)
 	}
 	return nil
 }
 
-// WriteEnvFile writes decrypted secrets to /home/<user>/.env with mode 0600.
+// WriteEnvFile writes decrypted secrets to <homeDir>/.env with mode 0600.
 // Also writes a global gitignore that blocks .env, .git-credentials, and
 // secrets.sops.yaml from accidental commits.
-func WriteEnvFile(username string, secrets map[string]string) error {
-	homeDir := fmt.Sprintf("/home/%s", username)
+func WriteEnvFile(username, homeDir string, secrets map[string]string) error {
 	envPath := filepath.Join(homeDir, ".env")
 
 	var sb strings.Builder
@@ -49,7 +64,7 @@ func WriteEnvFile(username string, secrets map[string]string) error {
 		return fmt.Errorf("writing .env for %s: %w", username, err)
 	}
 
-	if out, err := exec.Command("chown", fmt.Sprintf("%s:%s", username, username), envPath).CombinedOutput(); err != nil {
+	if out, err := sys.Run("chown", fmt.Sprintf("%s:%s", username, username), envPath); err != nil {
 		return fmt.Errorf("chown .env for %s: %w\n%s", username, err, out)
 	}
 
@@ -92,7 +107,7 @@ id_rsa
 // caller because an agent-owned file left root-owned will silently break
 // subsequent agent operations (git reads, claude writes).
 func chownToUser(path, username string) error {
-	out, err := exec.Command("chown", fmt.Sprintf("%s:%s", username, username), path).CombinedOutput()
+	out, err := sys.Run("chown", fmt.Sprintf("%s:%s", username, username), path)
 	if err != nil {
 		return fmt.Errorf("chown %s: %w\n%s", path, err, out)
 	}
@@ -171,8 +186,7 @@ exit 0
 // their git config at it via core.hooksPath. Idempotent - safe to call every
 // provision. The hook rejects pushes whose diff contains credential patterns,
 // as a client-side defense layer on top of GitHub's push protection.
-func InstallGitHooks(username string) error {
-	homeDir := fmt.Sprintf("/home/%s", username)
+func InstallGitHooks(username, homeDir string) error {
 	hooksDir := filepath.Join(homeDir, ".config", "git", "hooks")
 	hookPath := filepath.Join(hooksDir, "pre-push")
 
@@ -203,7 +217,7 @@ func InstallGitHooks(username string) error {
 // matching env vars are present in the secrets map. Idempotent — safe to call
 // every provision. The wrangler binary auto-refreshes the OAuth token using
 // the refresh token, so this stays valid as long as the refresh token does.
-func WriteWranglerConfig(username string, secrets map[string]string) error {
+func WriteWranglerConfig(username, homeDir string, secrets map[string]string) error {
 	oauth := secrets["WRANGLER_OAUTH_TOKEN"]
 	refresh := secrets["WRANGLER_REFRESH_TOKEN"]
 	expiration := secrets["WRANGLER_EXPIRATION"]
@@ -211,7 +225,7 @@ func WriteWranglerConfig(username string, secrets map[string]string) error {
 		return nil // not configured for this agent
 	}
 
-	configDir := fmt.Sprintf("/home/%s/.config/.wrangler/config", username)
+	configDir := filepath.Join(homeDir, ".config", ".wrangler", "config")
 	if err := os.MkdirAll(configDir, 0755); err != nil {
 		return fmt.Errorf("creating wrangler config dir: %w", err)
 	}
@@ -226,14 +240,14 @@ scopes = [ "account:read", "user:read", "workers:write", "workers_kv:write", "wo
 	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
 		return fmt.Errorf("writing wrangler config: %w", err)
 	}
-	ChownPath(fmt.Sprintf("/home/%s/.config", username), username)
+	ChownPath(filepath.Join(homeDir, ".config"), username)
 	return nil
 }
 
 // EnsureSSHKey generates an ed25519 SSH keypair for the agent if one doesn't exist.
 // The public key is returned so it can be displayed/distributed.
-func EnsureSSHKey(username string) (string, error) {
-	sshDir := fmt.Sprintf("/home/%s/.ssh", username)
+func EnsureSSHKey(username, homeDir string) (string, error) {
+	sshDir := filepath.Join(homeDir, ".ssh")
 	keyPath := filepath.Join(sshDir, "id_ed25519")
 	pubPath := keyPath + ".pub"
 
@@ -243,7 +257,7 @@ func EnsureSSHKey(username string) (string, error) {
 	if err := chownToUser(sshDir, username); err != nil {
 		return "", fmt.Errorf("chowning %s: %w", sshDir, err)
 	}
-	if out, err := exec.Command("chmod", "700", sshDir).CombinedOutput(); err != nil {
+	if out, err := sys.Run("chmod", "700", sshDir); err != nil {
 		return "", fmt.Errorf("chmod 700 %s: %w\n%s", sshDir, err, out)
 	}
 
@@ -256,12 +270,12 @@ func EnsureSSHKey(username string) (string, error) {
 		return strings.TrimSpace(string(data)), nil
 	}
 
-	out, err := exec.Command("sudo", "-u", username, "ssh-keygen",
+	out, err := sys.Run("sudo", "-u", username, "ssh-keygen",
 		"-t", "ed25519",
 		"-N", "",
 		"-f", keyPath,
 		"-C", username+"@clem",
-	).CombinedOutput()
+	)
 	if err != nil {
 		return "", fmt.Errorf("ssh-keygen: %w\n%s", err, out)
 	}
@@ -283,8 +297,7 @@ func EnsureSSHKey(username string) (string, error) {
 // We write both. Without ~/.claude.json, fresh agents hit the "Security notes —
 // Press Enter" screen and the "Quick safety check: trust this folder?" prompt
 // before the runner can inject its prompt, causing lost first iterations.
-func WriteSettings(username string) error {
-	homeDir := fmt.Sprintf("/home/%s", username)
+func WriteSettings(username, homeDir string) error {
 	claudeDir := filepath.Join(homeDir, ".claude")
 	if err := os.MkdirAll(claudeDir, 0755); err != nil {
 		return fmt.Errorf("creating .claude dir: %w", err)
@@ -310,7 +323,7 @@ func WriteSettings(username string) error {
 	// lastOnboardingVersion prevents the next claude upgrade from re-prompting.
 	// projects.<workdir>.hasTrustDialogAccepted dismisses the folder-trust
 	// dialog for the agent's working directory.
-	workDirKey := fmt.Sprintf("/home/%s/%s", username, projectFromUsername(username))
+	workDirKey := filepath.Join(homeDir, projectFromUsername(username))
 	appState := fmt.Sprintf(`{
   "hasCompletedOnboarding": true,
   "lastOnboardingVersion": "99.0.0",
@@ -354,11 +367,11 @@ func InstallService(cfg *config.Config, agentKey string, serviceContent string) 
 		return fmt.Errorf("writing service file %s: %w", servicePath, err)
 	}
 
-	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+	if out, err := sys.Run("systemctl", "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w\n%s", err, out)
 	}
 
-	if out, err := exec.Command("systemctl", "enable", serviceName).CombinedOutput(); err != nil {
+	if out, err := sys.Run("systemctl", "enable", serviceName); err != nil {
 		return fmt.Errorf("systemctl enable %s: %w\n%s", serviceName, err, out)
 	}
 	return nil
@@ -372,11 +385,11 @@ func InstallServiceByName(serviceName string, serviceContent string) error {
 		return fmt.Errorf("writing service file %s: %w", servicePath, err)
 	}
 
-	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+	if out, err := sys.Run("systemctl", "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w\n%s", err, out)
 	}
 
-	if out, err := exec.Command("systemctl", "enable", serviceName).CombinedOutput(); err != nil {
+	if out, err := sys.Run("systemctl", "enable", serviceName); err != nil {
 		return fmt.Errorf("systemctl enable %s: %w\n%s", serviceName, err, out)
 	}
 	return nil
@@ -397,10 +410,10 @@ func InstallWatchdogTimer(cfg *config.Config, serviceContent, timerContent strin
 		return fmt.Errorf("writing watchdog timer: %w", err)
 	}
 
-	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+	if out, err := sys.Run("systemctl", "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w\n%s", err, out)
 	}
-	if out, err := exec.Command("systemctl", "enable", "--now", timerName).CombinedOutput(); err != nil {
+	if out, err := sys.Run("systemctl", "enable", "--now", timerName); err != nil {
 		return fmt.Errorf("systemctl enable --now %s: %w\n%s", timerName, err, out)
 	}
 	return nil
@@ -408,7 +421,7 @@ func InstallWatchdogTimer(cfg *config.Config, serviceContent, timerContent strin
 
 // StartService starts a systemd service.
 func StartService(serviceName string) error {
-	out, err := exec.Command("systemctl", "start", serviceName).CombinedOutput()
+	out, err := sys.Run("systemctl", "start", serviceName)
 	if err != nil {
 		return fmt.Errorf("systemctl start %s: %w\n%s", serviceName, err, out)
 	}
@@ -417,7 +430,7 @@ func StartService(serviceName string) error {
 
 // StopService stops a systemd service.
 func StopService(serviceName string) error {
-	out, err := exec.Command("systemctl", "stop", serviceName).CombinedOutput()
+	out, err := sys.Run("systemctl", "stop", serviceName)
 	if err != nil {
 		return fmt.Errorf("systemctl stop %s: %w\n%s", serviceName, err, out)
 	}
@@ -426,7 +439,7 @@ func StopService(serviceName string) error {
 
 // SystemdState returns the ActiveState of a systemd unit.
 func SystemdState(serviceName string) string {
-	out, err := exec.Command("systemctl", "show", "-p", "ActiveState", "--value", serviceName).Output()
+	out, err := sys.Run("systemctl", "show", "-p", "ActiveState", "--value", serviceName)
 	if err != nil {
 		return "unknown"
 	}
@@ -435,7 +448,7 @@ func SystemdState(serviceName string) string {
 
 // TmuxAlive returns true if a tmux session with the given name exists.
 func TmuxAlive(sessionName string) bool {
-	err := exec.Command("tmux", "has-session", "-t", sessionName).Run()
+	_, err := sys.Run("tmux", "has-session", "-t", sessionName)
 	return err == nil
 }
 
@@ -446,10 +459,10 @@ type credentials struct {
 	} `json:"claudeAiOauth"`
 }
 
-// TokenExpiry reads the Claude token expiry for a given OS user.
+// TokenExpiry reads the Claude token expiry from <homeDir>/.claude/.credentials.json.
 // Returns zero time if missing or unreadable.
-func TokenExpiry(username string) time.Time {
-	credPath := fmt.Sprintf("/home/%s/.claude/.credentials.json", username)
+func TokenExpiry(homeDir string) time.Time {
+	credPath := filepath.Join(homeDir, ".claude", ".credentials.json")
 	data, err := os.ReadFile(credPath)
 	if err != nil {
 		return time.Time{}
@@ -465,8 +478,8 @@ func TokenExpiry(username string) time.Time {
 }
 
 // NeedsLogin returns true if the token is missing or expires within 7 days.
-func NeedsLogin(username string) bool {
-	expiry := TokenExpiry(username)
+func NeedsLogin(homeDir string) bool {
+	expiry := TokenExpiry(homeDir)
 	if expiry.IsZero() {
 		return true
 	}
@@ -477,8 +490,7 @@ func NeedsLogin(username string) bool {
 // Errors are intentionally swallowed — callers use this for tidy-up where
 // a failure doesn't block the operation. Prefer chownToUser for fatal paths.
 func ChownPath(path, username string) {
-	//nolint:errcheck // best-effort by design; see function comment
-	exec.Command("chown", "-R", fmt.Sprintf("%s:%s", username, username), path).Run()
+	sys.Run("chown", "-R", fmt.Sprintf("%s:%s", username, username), path) //nolint:errcheck // best-effort by design; see function comment
 }
 
 // EnsureOwnedDir creates path (and any missing parents) and chowns the full
@@ -495,7 +507,7 @@ func EnsureOwnedDir(path, username string) error {
 	home := fmt.Sprintf("/home/%s", username)
 	current := path
 	for strings.HasPrefix(current, home) {
-		out, err := exec.Command("chown", fmt.Sprintf("%s:%s", username, username), current).CombinedOutput()
+		out, err := sys.Run("chown", fmt.Sprintf("%s:%s", username, username), current)
 		if err != nil {
 			return fmt.Errorf("chown %s to %s: %w\n%s", current, username, err, out)
 		}
@@ -505,7 +517,7 @@ func EnsureOwnedDir(path, username string) error {
 		current = filepath.Dir(current)
 	}
 	// Recursive chown inside path itself for nested files.
-	out, err := exec.Command("chown", "-R", fmt.Sprintf("%s:%s", username, username), path).CombinedOutput()
+	out, err := sys.Run("chown", "-R", fmt.Sprintf("%s:%s", username, username), path)
 	if err != nil {
 		return fmt.Errorf("chown -R %s to %s: %w\n%s", path, username, err, out)
 	}

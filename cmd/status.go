@@ -53,7 +53,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		expiry := agent.TokenExpiry(osUser)
+		expiry := agent.TokenExpiry(fmt.Sprintf("/home/%s", osUser))
 		expiryStr := "missing"
 		if !expiry.IsZero() {
 			daysLeft := int(time.Until(expiry).Hours() / 24)
