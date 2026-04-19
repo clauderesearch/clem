@@ -1,6 +1,6 @@
 ---
 layout: default
-title: clem — Continuously Looping Engineering Machines
+title: clem - Continuously Looping Engineering Machines
 description: docker-compose for Claude Code agents. Persistent teams of agents, 24/7, on any Linux host.
 ---
 
@@ -61,12 +61,12 @@ Full README with config reference, coordination backends (Discord / Slack), runt
 
 ## Why
 
-Because an agent team shouldn't require a cluster. Because running Claude Code sessions by hand doesn't scale past a day. Because Linux already has everything you need — OS users, tmux, systemd — and the right abstraction is just *configure it once*.
+Because an agent team shouldn't require a cluster. Because running Claude Code sessions by hand doesn't scale past a day. Because Linux already has everything you need - OS users, tmux, systemd - and the right abstraction is just *configure it once*.
 
 ## Community
 
 - [GitHub Discussions](https://github.com/jahwag/clem/discussions)
 - [Discord server](https://discord.gg/pR4qeMH4u4)
-- [Issues](https://github.com/jahwag/clem/issues) — bug reports + feature requests
+- [Issues](https://github.com/jahwag/clem/issues) - bug reports + feature requests
 
 Licensed under the [MIT License](https://github.com/jahwag/clem/blob/main/LICENSE).
