@@ -68,17 +68,34 @@ id_rsa
 	if err := os.WriteFile(globalIgnore, []byte(ignoreContent), 0644); err != nil {
 		return fmt.Errorf("writing gitignore_global: %w", err)
 	}
-	exec.Command("chown", fmt.Sprintf("%s:%s", username, username), globalIgnore).Run()
+	if err := chownToUser(globalIgnore, username); err != nil {
+		return fmt.Errorf("chowning %s: %w", globalIgnore, err)
+	}
 
 	// Write/update ~/.gitconfig directly to avoid sudo subshell quoting issues
 	gitConfigPath := filepath.Join(homeDir, ".gitconfig")
 	existing, _ := os.ReadFile(gitConfigPath)
 	if !strings.Contains(string(existing), "excludesfile") {
 		appended := string(existing) + fmt.Sprintf("\n[core]\n\texcludesfile = %s\n", globalIgnore)
-		os.WriteFile(gitConfigPath, []byte(appended), 0644)
-		exec.Command("chown", fmt.Sprintf("%s:%s", username, username), gitConfigPath).Run()
+		if err := os.WriteFile(gitConfigPath, []byte(appended), 0644); err != nil {
+			return fmt.Errorf("writing %s: %w", gitConfigPath, err)
+		}
+		if err := chownToUser(gitConfigPath, username); err != nil {
+			return fmt.Errorf("chowning %s: %w", gitConfigPath, err)
+		}
 	}
 
+	return nil
+}
+
+// chownToUser sets owner/group on path to username:username. Fatal for the
+// caller because an agent-owned file left root-owned will silently break
+// subsequent agent operations (git reads, claude writes).
+func chownToUser(path, username string) error {
+	out, err := exec.Command("chown", fmt.Sprintf("%s:%s", username, username), path).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("chown %s: %w\n%s", path, err, out)
+	}
 	return nil
 }
 
@@ -123,8 +140,12 @@ func EnsureSSHKey(username string) (string, error) {
 	if err := os.MkdirAll(sshDir, 0700); err != nil {
 		return "", fmt.Errorf("creating .ssh dir: %w", err)
 	}
-	exec.Command("chown", username+":"+username, sshDir).Run()
-	exec.Command("chmod", "700", sshDir).Run()
+	if err := chownToUser(sshDir, username); err != nil {
+		return "", fmt.Errorf("chowning %s: %w", sshDir, err)
+	}
+	if out, err := exec.Command("chmod", "700", sshDir).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("chmod 700 %s: %w\n%s", sshDir, err, out)
+	}
 
 	if _, err := os.Stat(keyPath); err == nil {
 		// Already exists; return the existing public key
@@ -271,8 +292,12 @@ func InstallWatchdogTimer(cfg *config.Config, serviceContent, timerContent strin
 		return fmt.Errorf("writing watchdog timer: %w", err)
 	}
 
-	exec.Command("systemctl", "daemon-reload").Run()
-	exec.Command("systemctl", "enable", "--now", timerName).Run()
+	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl daemon-reload: %w\n%s", err, out)
+	}
+	if out, err := exec.Command("systemctl", "enable", "--now", timerName).CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl enable --now %s: %w\n%s", timerName, err, out)
+	}
 	return nil
 }
 
@@ -344,7 +369,10 @@ func NeedsLogin(username string) bool {
 }
 
 // ChownPath changes ownership of a path to the given user (best effort).
+// Errors are intentionally swallowed — callers use this for tidy-up where
+// a failure doesn't block the operation. Prefer chownToUser for fatal paths.
 func ChownPath(path, username string) {
+	//nolint:errcheck // best-effort by design; see function comment
 	exec.Command("chown", "-R", fmt.Sprintf("%s:%s", username, username), path).Run()
 }
 
@@ -470,7 +498,7 @@ func InstallCaveman(username string) error {
 		if err := os.WriteFile(knownPath, []byte(merged), 0644); err != nil {
 			return fmt.Errorf("writing known_marketplaces.json: %w", err)
 		}
-		exec.Command("chown", "-R", fmt.Sprintf("%s:%s", username, username), filepath.Dir(knownPath)).Run()
+		ChownPath(filepath.Dir(knownPath), username)
 	}
 
 	// Install + enable plugin. "enable" returns non-zero when already
