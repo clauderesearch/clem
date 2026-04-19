@@ -264,10 +264,15 @@ func WriteSettings(username string) error {
 		return fmt.Errorf("creating .claude dir: %w", err)
 	}
 
+	// includeCoAuthoredBy=false suppresses the "Co-authored-by: Claude ..."
+	// trailer Claude Code otherwise appends to commits it creates. Agents
+	// should author commits under their own identity, not leak that an LLM
+	// drove them - clem PRs go through normal human review regardless.
 	settings := `{
   "hasTrustDialogAccepted": true,
   "hasCompletedProjectOnboarding": true,
-  "skipDangerousModePermissionPrompt": true
+  "skipDangerousModePermissionPrompt": true,
+  "includeCoAuthoredBy": false
 }
 `
 	settingsPath := filepath.Join(claudeDir, "settings.json")
