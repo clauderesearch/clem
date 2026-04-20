@@ -226,11 +226,12 @@ done
 exit 0
 `, SecretPatternRegex, SecretCodePatternRegex, UnicodeTrapRegex)
 
-// ConfigureGit writes SSH commit-signing configuration to the agent's
-// ~/.gitconfig and creates ~/.ssh/allowed_signers so git can verify signatures
-// locally. Idempotent — safe to call every provision.
-// pubKey is the agent's ed25519 public key (returned by EnsureSSHKey).
-func ConfigureGit(username, homeDir, pubKey string) error {
+// ConfigureGit writes SSH commit-signing configuration and optionally the git
+// user identity to the agent's ~/.gitconfig. Idempotent — safe to call every
+// provision. pubKey is the agent's ed25519 public key (returned by EnsureSSHKey).
+// gitName and gitEmail, when non-empty, set git user.name / user.email; existing
+// values are preserved (operator-set identity is never overwritten).
+func ConfigureGit(username, homeDir, pubKey, gitName, gitEmail string) error {
 	sshDir := filepath.Join(homeDir, ".ssh")
 	if err := os.MkdirAll(sshDir, 0700); err != nil {
 		return fmt.Errorf("creating .ssh dir: %w", err)
@@ -247,22 +248,34 @@ func ConfigureGit(username, homeDir, pubKey string) error {
 
 	gitConfigPath := filepath.Join(homeDir, ".gitconfig")
 	existing, _ := os.ReadFile(gitConfigPath)
-	if !strings.Contains(string(existing), "gpgsign") {
+	content := string(existing)
+
+	var extra string
+	if !strings.Contains(content, "gpgsign") {
 		signingKey := filepath.Join(sshDir, "id_ed25519.pub")
-		block := fmt.Sprintf(
-			"\n[user]\n\tsigningkey = %s\n[commit]\n\tgpgsign = true\n[gpg]\n\tformat = ssh\n[gpg \"ssh\"]\n\tallowedSignersFile = %s\n",
-			signingKey,
-			allowedSignersPath,
+		extra += fmt.Sprintf(
+			"\n[user]\n\tsigningkey = %s\n[commit]\n\tgpgsign = true\n[gpg]\n\tformat = ssh\n[gpg \"ssh\"]\n\tallowedSignersFile = %s",
+			signingKey, allowedSignersPath,
 		)
-		appended := string(existing) + block
-		if err := os.WriteFile(gitConfigPath, []byte(appended), 0644); err != nil {
-			return fmt.Errorf("writing %s: %w", gitConfigPath, err)
-		}
-		if err := chownToUser(gitConfigPath, username); err != nil {
-			return fmt.Errorf("chowning %s: %w", gitConfigPath, err)
-		}
 	}
-	return nil
+	var identityLines []string
+	if gitName != "" && !strings.Contains(content, "\tname = ") {
+		identityLines = append(identityLines, "\tname = "+gitName)
+	}
+	if gitEmail != "" && !strings.Contains(content, "\temail = ") {
+		identityLines = append(identityLines, "\temail = "+gitEmail)
+	}
+	if len(identityLines) > 0 {
+		extra += "\n[user]\n" + strings.Join(identityLines, "\n")
+	}
+	if extra == "" {
+		return nil
+	}
+
+	if err := os.WriteFile(gitConfigPath, []byte(content+extra+"\n"), 0644); err != nil {
+		return fmt.Errorf("writing %s: %w", gitConfigPath, err)
+	}
+	return chownToUser(gitConfigPath, username)
 }
 
 // InstallGitHooks writes a global pre-push hook for the agent user and points

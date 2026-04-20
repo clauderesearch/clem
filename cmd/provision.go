@@ -105,6 +105,10 @@ func runProvision(cmd *cobra.Command, args []string) error {
 			} else if secrets["WRANGLER_OAUTH_TOKEN"] != "" {
 				fmt.Printf("  wrote wrangler config for %s\n", osUser)
 			}
+
+			if secrets["GH_TOKEN"] != "" && ac.GitEmail == "" {
+				fmt.Printf("  warning: agent %s has GH_TOKEN but no git_email in clem.yaml — commits may leak operator identity\n", agentKey)
+			}
 		}
 
 		// 3. Write Claude Code settings (skip MCP trust dialog, onboarding)
@@ -130,12 +134,12 @@ func runProvision(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  ssh pubkey: %s\n", pubKey)
 		}
 
-		// 3b. Configure git commit signing via the agent's SSH key.
+		// 3b. Configure git commit signing and user identity via the agent's SSH key.
 		if pubKey != "" {
-			if err := agent.ConfigureGit(osUser, homeDir, pubKey); err != nil {
-				fmt.Printf("  warning: git signing config for %s: %v\n", osUser, err)
+			if err := agent.ConfigureGit(osUser, homeDir, pubKey, ac.GitName, ac.GitEmail); err != nil {
+				fmt.Printf("  warning: git config for %s: %v\n", osUser, err)
 			} else {
-				fmt.Printf("  configured git commit signing for %s\n", osUser)
+				fmt.Printf("  configured git signing + identity for %s\n", osUser)
 			}
 		}
 

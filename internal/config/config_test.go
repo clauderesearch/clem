@@ -242,3 +242,42 @@ agents:
 		t.Errorf("SubagentModel = %q, want %q (bedrock is Anthropic-backed)", got, DefaultSubagentModel)
 	}
 }
+
+func TestLoad_GitIdentityParsed(t *testing.T) {
+	path := writeYAML(t, `
+project: myteam
+coordination:
+  backend: discord
+  server_id: "1"
+  channels: {general: "g"}
+agents:
+  lead:
+    name: "Ada"
+    model: "claude-sonnet-4-6"
+    git_name: "clauderesearch"
+    git_email: "212849679+clauderesearch@users.noreply.github.com"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	ac := cfg.Agents["lead"]
+	if ac.GitName != "clauderesearch" {
+		t.Errorf("GitName = %q, want %q", ac.GitName, "clauderesearch")
+	}
+	if ac.GitEmail != "212849679+clauderesearch@users.noreply.github.com" {
+		t.Errorf("GitEmail = %q, want %q", ac.GitEmail, "212849679+clauderesearch@users.noreply.github.com")
+	}
+}
+
+func TestLoad_GitIdentityOptional(t *testing.T) {
+	path := writeYAML(t, minYAML(""))
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	ac := cfg.Agents["lead"]
+	if ac.GitName != "" || ac.GitEmail != "" {
+		t.Errorf("expected empty git identity when unset, got name=%q email=%q", ac.GitName, ac.GitEmail)
+	}
+}
