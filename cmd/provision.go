@@ -74,6 +74,7 @@ func runProvision(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  provider: %s\n", ac.Provider)
 		}
 
+		var ghToken string
 		secrets, err := vault.DecryptForAgent(agentKey, ac.Vaults)
 		if err != nil {
 			fmt.Printf("  warning: could not decrypt secrets for %s: %v\n", agentKey, err)
@@ -106,7 +107,8 @@ func runProvision(cmd *cobra.Command, args []string) error {
 				fmt.Printf("  wrote wrangler config for %s\n", osUser)
 			}
 
-			if secrets["GH_TOKEN"] != "" && ac.GitEmail == "" {
+			ghToken = secrets["GH_TOKEN"]
+			if ghToken != "" && ac.GitEmail == "" {
 				fmt.Printf("  warning: agent %s has GH_TOKEN but no git_email in clem.yaml — commits may leak operator identity\n", agentKey)
 			}
 		}
@@ -140,6 +142,14 @@ func runProvision(cmd *cobra.Command, args []string) error {
 				fmt.Printf("  warning: git config for %s: %v\n", osUser, err)
 			} else {
 				fmt.Printf("  configured git signing + identity for %s\n", osUser)
+			}
+
+			// 3b1. Register the signing key on GitHub so commits show as verified.
+			// Requires write:public_key scope on the agent's GH_TOKEN.
+			if err := agent.RegisterSSHSigningKey(pubKey, ghToken); err != nil {
+				fmt.Printf("  warning: register SSH signing key for %s: %v\n", osUser, err)
+			} else if ghToken != "" {
+				fmt.Printf("  registered SSH signing key on GitHub for %s\n", osUser)
 			}
 		}
 

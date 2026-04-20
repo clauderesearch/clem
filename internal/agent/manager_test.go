@@ -3,6 +3,8 @@ package agent
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -716,5 +718,86 @@ func TestInstallGitHooks_WritesHookAndConfig(t *testing.T) {
 	}
 	if !strings.Contains(string(gitConfigData), "hooksPath") {
 		t.Errorf(".gitconfig missing hooksPath: %s", gitConfigData)
+	}
+}
+
+func withGHHTTPClient(t *testing.T, handler http.Handler) {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	orig := ghHTTPClient
+	ghHTTPClient = srv.Client()
+	// Redirect all requests to the test server by rewriting the URL host.
+	// The test handler receives the full path so it can assert on it.
+	ghHTTPClient.Transport = &rewriteTransport{base: srv.Client().Transport, host: srv.URL}
+	t.Cleanup(func() { ghHTTPClient = orig })
+}
+
+type rewriteTransport struct {
+	base http.RoundTripper
+	host string
+}
+
+func (rt *rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.URL.Scheme = "http"
+	req.URL.Host = strings.TrimPrefix(rt.host, "http://")
+	return rt.base.RoundTrip(req)
+}
+
+func TestRegisterSSHSigningKey_NoToken(t *testing.T) {
+	err := RegisterSSHSigningKey("ssh-ed25519 AAAA testuser@clem", "")
+	if err == nil {
+		t.Fatal("expected error when ghToken is empty")
+	}
+	if !strings.Contains(err.Error(), "GH_TOKEN required") {
+		t.Errorf("expected 'GH_TOKEN required' in error, got: %v", err)
+	}
+}
+
+func TestRegisterSSHSigningKey_Success(t *testing.T) {
+	withGHHTTPClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if !strings.Contains(r.URL.Path, "ssh_signing_keys") {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer fake-token" {
+			t.Errorf("unexpected Authorization: %s", r.Header.Get("Authorization"))
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+
+	err := RegisterSSHSigningKey("ssh-ed25519 AAAA testuser@clem", "fake-token")
+	if err != nil {
+		t.Fatalf("expected no error on 201, got: %v", err)
+	}
+}
+
+func TestRegisterSSHSigningKey_AlreadyRegistered(t *testing.T) {
+	withGHHTTPClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		w.Write([]byte(`{"message":"key is already in use"}`)) //nolint:errcheck
+	}))
+
+	err := RegisterSSHSigningKey("ssh-ed25519 AAAA testuser@clem", "fake-token")
+	if err != nil {
+		t.Fatalf("expected nil error when key already registered, got: %v", err)
+	}
+}
+
+func TestRegisterSSHSigningKey_APIError(t *testing.T) {
+	withGHHTTPClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"Must have admin rights to Repository."}`)) //nolint:errcheck
+	}))
+
+	err := RegisterSSHSigningKey("ssh-ed25519 AAAA testuser@clem", "fake-token")
+	if err == nil {
+		t.Fatal("expected error on non-201/non-422 response")
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Errorf("expected status code 403 in error, got: %v", err)
 	}
 }
