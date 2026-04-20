@@ -18,6 +18,15 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - sample: anthropic
+            tag_suffix: ""
+          - sample: ollama-nemotron-4b
+            tag_suffix: "-ollama"
+          - sample: slack-nemotron-4b
+            tag_suffix: "-slack"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,7 +50,9 @@ jobs:
           context: .
           file: samples/Dockerfile
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            SAMPLE=${{ matrix.sample }}
           push: true
           tags: |
-            ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}${{ matrix.tag_suffix }}:${{ github.ref_name }}
+            ${{ env.IMAGE_NAME }}${{ matrix.tag_suffix }}:latest
