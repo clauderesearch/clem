@@ -110,11 +110,30 @@ type AgentConfig struct {
 	// logs a warning at runtime.
 	GitName  string `yaml:"git_name"`
 	GitEmail string `yaml:"git_email"`
-	// EgressRestriction adds systemd IPAddressDeny=any + IPAddressAllow rules to
-	// the agent service unit. When enabled the agent can only reach GitHub,
-	// Anthropic, Discord, and localhost; all other outbound TCP/UDP is blocked at
-	// the kernel level, regardless of what the model requests.
-	EgressRestriction bool `yaml:"egress_restriction"`
+	// EgressRestrictionExperimental adds systemd IPAddressDeny=any + IPAddressAllow
+	// rules to the agent service unit. EXPERIMENTAL — known limitations:
+	//
+	//   DNS: only works if the host uses systemd-resolved (127.0.0.53). Hosts
+	//   using an external resolver (1.1.1.1, 8.8.8.8, corporate DNS) will fail
+	//   DNS resolution entirely because those IPs are not in the allowlist.
+	//
+	//   Cloudflare width: the Cloudflare CIDRs (104.16.0.0/13 etc.) cover
+	//   millions of CF-fronted sites beyond Anthropic and Discord. A compromised
+	//   agent can still reach arbitrary CF-hosted attacker infrastructure.
+	//
+	//   CIDR drift: allowlist is hardcoded. GitHub, Cloudflare, and Discord
+	//   rotate ranges; the list will go stale silently and block legitimate
+	//   traffic. Refresh manually before each release or automate via
+	//   `curl https://api.github.com/meta`.
+	//
+	//   DNS exfil: kernel IP filter does not inspect DNS query payloads. An
+	//   agent can exfil data by encoding secrets in subdomain labels sent to
+	//   an attacker-controlled nameserver (e.g. base64(secret).evil.example.com).
+	//   This restriction does NOT close that channel.
+	//
+	// Despite these limitations, this provides meaningful containment against
+	// naive outbound connections. Use with understanding of the gaps above.
+	EgressRestrictionExperimental bool `yaml:"egress_restriction_experimental"`
 }
 
 // RuntimeKind returns the normalized runtime name for this agent.

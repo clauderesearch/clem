@@ -256,14 +256,17 @@ WantedBy=multi-user.target
 `
 
 // egressDirectives is the systemd IP firewall block injected when
-// egress_restriction is enabled. Allows only the services the agent legitimately
-// needs: GitHub (git + API), Anthropic API (via Cloudflare), Discord (via
-// Cloudflare + own AS), and localhost (Ollama, MCP unix sockets).
+// egress_restriction_experimental is enabled. Allows GitHub (git + API),
+// Anthropic/Discord (via Cloudflare), and localhost (Ollama, MCP unix sockets).
 //
-// CIDRs are derived from published ASN/Meta data (GitHub Meta API, Cloudflare
-// published ranges, Discord's published ranges). Refresh with:
-//   curl https://api.github.com/meta | jq '[.web[], .api[], .git[]] | unique[]'
-const egressDirectives = `# Egress restriction (egress_restriction: true)
+// KNOWN LIMITATIONS — see AgentConfig.EgressRestrictionExperimental doc for full detail:
+//   - DNS: only works with systemd-resolved (127.0.0.53); external resolvers fail.
+//   - Cloudflare CIDRs cover millions of CF-hosted sites, not just Anthropic/Discord.
+//   - CIDRs are hardcoded and will drift. Refresh with:
+//       curl https://api.github.com/meta | jq '[.web[], .api[], .git[]] | unique[]'
+//   - DNS exfil (base64 in subdomain labels) is NOT blocked by IP-level filtering.
+const egressDirectives = `# Egress restriction (egress_restriction_experimental: true)
+# EXPERIMENTAL: see clem.yaml AgentConfig docs for known limitations.
 IPAddressDeny=any
 IPAddressAllow=localhost
 IPAddressAllow=127.0.0.0/8
@@ -372,7 +375,7 @@ func Generate(cfg *config.Config, agentKey string) string {
 func GenerateService(cfg *config.Config, agentKey string) string {
 	ac := cfg.Agents[agentKey]
 	egress := ""
-	if ac.EgressRestriction {
+	if ac.EgressRestrictionExperimental {
 		egress = egressDirectives
 	}
 	p := RunnerParams{

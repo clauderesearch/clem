@@ -138,7 +138,7 @@ func TestGenerateService_EgressRestrictionEnabled(t *testing.T) {
 		Model:             "claude-opus-4-7",
 		Iteration:         "1m",
 		Prompt:            "do the thing",
-		EgressRestriction: true,
+		EgressRestrictionExperimental: true,
 	})
 
 	out := GenerateService(cfg, "lead")
