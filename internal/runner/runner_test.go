@@ -131,3 +131,36 @@ func TestGenerate_PreservesUserKillPPID(t *testing.T) {
 		t.Fatalf("expected exactly one kill $PPID, got %d in:\n%s", c, out)
 	}
 }
+
+func TestGenerateService_EgressRestrictionEnabled(t *testing.T) {
+	cfg := baseCfg("lead", config.AgentConfig{
+		Name:              "Lead",
+		Model:             "claude-opus-4-7",
+		Iteration:         "1m",
+		Prompt:            "do the thing",
+		EgressRestriction: true,
+	})
+
+	out := GenerateService(cfg, "lead")
+
+	for _, want := range []string{"IPAddressDeny=any", "IPAddressAllow=localhost", "IPAddressAllow=140.82.112.0/20"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in service unit, got:\n%s", want, out)
+		}
+	}
+}
+
+func TestGenerateService_EgressRestrictionDisabled(t *testing.T) {
+	cfg := baseCfg("lead", config.AgentConfig{
+		Name:      "Lead",
+		Model:     "claude-opus-4-7",
+		Iteration: "1m",
+		Prompt:    "do the thing",
+	})
+
+	out := GenerateService(cfg, "lead")
+
+	if strings.Contains(out, "IPAddressDeny") {
+		t.Fatalf("expected no IPAddressDeny when egress_restriction unset, got:\n%s", out)
+	}
+}

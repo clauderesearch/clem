@@ -110,6 +110,11 @@ type AgentConfig struct {
 	// logs a warning at runtime.
 	GitName  string `yaml:"git_name"`
 	GitEmail string `yaml:"git_email"`
+	// EgressRestriction adds systemd IPAddressDeny=any + IPAddressAllow rules to
+	// the agent service unit. When enabled the agent can only reach GitHub,
+	// Anthropic, Discord, and localhost; all other outbound TCP/UDP is blocked at
+	// the kernel level, regardless of what the model requests.
+	EgressRestriction bool `yaml:"egress_restriction"`
 }
 
 // RuntimeKind returns the normalized runtime name for this agent.
