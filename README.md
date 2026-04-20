@@ -17,6 +17,14 @@
   <a href="https://github.com/jahwag/clem/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square" alt="PRs welcome"></a>
 </p>
 
+<!-- Demo cast: record with docs/demo.sh, upload to asciinema.org, replace CAST_ID with the numeric ID from the upload URL.
+<p align="center">
+  <a href="https://asciinema.org/a/CAST_ID">
+    <img src="https://asciinema.org/a/CAST_ID.svg" alt="clem provision demo" width="700">
+  </a>
+</p>
+-->
+
 <p align="center">
   <a href="https://myclementine.ai"><b>myclementine.ai</b></a> &middot;
   <a href="https://github.com/jahwag/clem#quickstart">Quickstart</a> &middot;
@@ -380,6 +388,17 @@ Safe. `useradd` is idempotent; systemd units are overwritten; `.env` is regenera
 ## Community
 
 Questions, ideas, showing off your team - join the [ClaudeSync / Clem Discord](https://discord.gg/pR4qeMH4u4).
+
+## Regenerating the demo cast
+
+When clem's provision flow changes, re-record and re-upload:
+
+```bash
+# On a fresh Linux host or inside samples/Dockerfile (--privileged, /bin/bash entrypoint):
+asciinema rec demo.cast -- bash docs/demo.sh
+asciinema upload demo.cast
+# Replace CAST_ID in README.md and docs/index.html with the numeric ID from the upload URL.
+```
 
 ## License
 
