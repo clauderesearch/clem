@@ -1,8 +1,11 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +32,54 @@ func (OSExecutor) Run(name string, args ...string) ([]byte, error) {
 
 // sys is the active Executor. Replaced in tests to avoid root/binary requirements.
 var sys Executor = OSExecutor{}
+
+// ghHTTPClient performs GitHub API calls. Replaced in tests to avoid real network calls.
+var ghHTTPClient = &http.Client{}
+
+// RegisterSSHSigningKey registers pubKey on the agent's GitHub account as a
+// signing key via POST /user/ssh_signing_keys. Requires a GH_TOKEN with the
+// write:public_key scope. Idempotent: returns nil if the key is already registered.
+func RegisterSSHSigningKey(pubKey, ghToken string) error {
+	if ghToken == "" {
+		return fmt.Errorf("GH_TOKEN required to register SSH signing key; grant write:public_key scope to the agent PAT")
+	}
+
+	type payload struct {
+		Title string `json:"title"`
+		Key   string `json:"key"`
+	}
+	body, err := json.Marshal(payload{Title: "clem-signing", Key: pubKey})
+	if err != nil {
+		return fmt.Errorf("marshaling signing key payload: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, "https://api.github.com/user/ssh_signing_keys", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("creating signing key request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+ghToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := ghHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("registering SSH signing key: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusCreated {
+		return nil
+	}
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusUnprocessableEntity &&
+		strings.Contains(string(respBody), "key is already in use") {
+		return nil
+	}
+
+	return fmt.Errorf("GitHub /user/ssh_signing_keys returned %d: %s", resp.StatusCode, respBody)
+}
 
 // EnsureUser creates the OS user if it doesn't already exist.
 func EnsureUser(username string) error {
