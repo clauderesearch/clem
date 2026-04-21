@@ -250,9 +250,38 @@ ExecStart=/usr/bin/tmux new-session -d -s {{.AgentKey}} {{.HomeDir}}/.local/bin/
 ExecStop=/usr/bin/tmux kill-session -t {{.AgentKey}}
 RemainAfterExit=yes
 Restart=no
-
+{{.EgressDirectives}}
 [Install]
 WantedBy=multi-user.target
+`
+
+// egressDirectives is the systemd IP firewall block injected when
+// egress_restriction_experimental is enabled. Allows GitHub (git + API),
+// Anthropic/Discord (via Cloudflare), and localhost (Ollama, MCP unix sockets).
+//
+// KNOWN LIMITATIONS — see AgentConfig.EgressRestrictionExperimental doc for full detail:
+//   - DNS: only works with systemd-resolved (127.0.0.53); external resolvers fail.
+//   - Cloudflare CIDRs cover millions of CF-hosted sites, not just Anthropic/Discord.
+//   - CIDRs are hardcoded and will drift. Refresh with:
+//       curl https://api.github.com/meta | jq '[.web[], .api[], .git[]] | unique[]'
+//   - DNS exfil (base64 in subdomain labels) is NOT blocked by IP-level filtering.
+const egressDirectives = `# Egress restriction (egress_restriction_experimental: true)
+# EXPERIMENTAL: see clem.yaml AgentConfig docs for known limitations.
+IPAddressDeny=any
+IPAddressAllow=localhost
+IPAddressAllow=127.0.0.0/8
+IPAddressAllow=::1/128
+# GitHub (web + API + git)
+IPAddressAllow=140.82.112.0/20
+IPAddressAllow=185.199.108.0/22
+IPAddressAllow=192.30.252.0/22
+IPAddressAllow=143.55.64.0/20
+# Anthropic API + Discord (both served via Cloudflare)
+IPAddressAllow=104.16.0.0/13
+IPAddressAllow=104.24.0.0/14
+IPAddressAllow=172.64.0.0/13
+# Discord own ASN (AS36459)
+IPAddressAllow=66.22.192.0/20
 `
 
 const ttydServiceTemplate = `[Unit]
@@ -273,20 +302,21 @@ WantedBy=multi-user.target
 `
 
 type RunnerParams struct {
-	Project        string
-	AgentKey       string
-	AgentName      string
-	Model          string
-	SubagentExport string
-	Prompt         string
-	OSUser         string
-	HomeDir        string
-	SleepActive    int
-	SleepNight     int
-	TtydPort       int
-	TtydBind       string
-	AlertChannel   string
-	AlertCurl      string
+	Project           string
+	AgentKey          string
+	AgentName         string
+	Model             string
+	SubagentExport    string
+	Prompt            string
+	OSUser            string
+	HomeDir           string
+	SleepActive       int
+	SleepNight        int
+	TtydPort          int
+	TtydBind          string
+	AlertChannel      string
+	AlertCurl         string
+	EgressDirectives  string
 }
 
 // Generate renders the runner.sh content for an agent. Dispatches on the
@@ -344,12 +374,17 @@ func Generate(cfg *config.Config, agentKey string) string {
 // GenerateService renders the systemd service unit content for an agent.
 func GenerateService(cfg *config.Config, agentKey string) string {
 	ac := cfg.Agents[agentKey]
+	egress := ""
+	if ac.EgressRestrictionExperimental {
+		egress = egressDirectives
+	}
 	p := RunnerParams{
-		Project:   cfg.Project,
-		AgentKey:  agentKey,
-		AgentName: ac.Name,
-		OSUser:    cfg.OSUsername(agentKey),
-		HomeDir:   fmt.Sprintf("/home/%s", cfg.OSUsername(agentKey)),
+		Project:          cfg.Project,
+		AgentKey:         agentKey,
+		AgentName:        ac.Name,
+		OSUser:           cfg.OSUsername(agentKey),
+		HomeDir:          fmt.Sprintf("/home/%s", cfg.OSUsername(agentKey)),
+		EgressDirectives: egress,
 	}
 	return renderTemplate(serviceTemplate, p)
 }
@@ -390,6 +425,7 @@ func renderTemplate(tmpl string, p RunnerParams) string {
 		"{{.AlertChannel}}", p.AlertChannel,
 		"{{.AlertCurl}}", p.AlertCurl,
 		"{{.SubagentExport}}", p.SubagentExport,
+		"{{.EgressDirectives}}", p.EgressDirectives,
 	)
 	return r.Replace(tmpl)
 }
