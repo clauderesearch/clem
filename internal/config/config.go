@@ -79,8 +79,8 @@ type AgentConfig struct {
 	Role  string `yaml:"role"`
 	Model string `yaml:"model"`
 	// Iteration is a Go-style duration string (e.g. "30s", "1m30s", "2h").
-	// Parsed via time.ParseDuration. Sleep between agent sessions during
-	// active hours (07-22); doubled overnight. Default 5m.
+	// Parsed via time.ParseDuration. Sleep between agent sessions; same
+	// value applies day and night. Default 5m.
 	Iteration       string   `yaml:"iteration"`
 	Vaults          []string `yaml:"vaults"`
 	Prompt          string   `yaml:"prompt"`
@@ -103,6 +103,11 @@ type AgentConfig struct {
 	// than the main session. Accepts model aliases (sonnet, haiku, opus) or
 	// full IDs (claude-sonnet-4-6). Empty = inherit main model.
 	SubagentModel string `yaml:"subagent_model"`
+	// Effort caps extended-thinking budget per session via Claude Code's
+	// effortLevel setting. Accepts "low", "medium", "high". Empty = use
+	// Claude Code's own default (currently medium). Lowering trims output
+	// tokens — the dominant cost driver in agent loops.
+	Effort string `yaml:"effort"`
 	// GitName and GitEmail set the agent's git user identity during provision.
 	// Without these, commits are authored with whatever identity the OAuth login
 	// stored, which may leak the operator's personal email into public history.

@@ -81,18 +81,9 @@ if os.environ.get('SSH_HOST') and os.environ.get('ES_PASSWORD'):
             'ES_PASSWORD': os.environ['ES_PASSWORD'],
         }
     }
-# GitHub MCP (needs GH_TOKEN)
-if os.environ.get('GH_TOKEN'):
-    cfg['mcpServers']['github'] = {
-        'command': '/usr/local/bin/github-mcp-server',
-        'args': ['stdio'],
-        'env': {'GITHUB_PERSONAL_ACCESS_TOKEN': os.environ['GH_TOKEN']}
-    }
-# Context7 (library docs lookup — no auth required)
-cfg['mcpServers']['context7'] = {
-    'command': 'npx',
-    'args': ['-y', '@upstash/context7-mcp']
-}
+# GitHub MCP and context7 are NOT registered here by default — agents use
+# the gh CLI directly (more context-efficient per Anthropic's cost docs) and
+# can opt in to context7 per-project by checking a .mcp.json into the workdir.
 # Social media (Typefully backend — local MCP server)
 if os.environ.get('TYPEFULLY_API_KEY'):
     cfg['mcpServers']['social'] = {
@@ -389,7 +380,12 @@ func Generate(cfg *config.Config, agentKey string) string {
 		OSUser:          cfg.OSUsername(agentKey),
 		HomeDir:         fmt.Sprintf("/home/%s", cfg.OSUsername(agentKey)),
 		SleepActive:     iterSec,
-		SleepNight:      iterSec * 2,
+		// Night sleep matches active. The previous 2x doubler hurt spend:
+		// Anthropic's prompt cache TTL is 5 min, so any iter > 5m at night
+		// guaranteed a cache miss every session — same session count cut
+		// you'd get from cold-cache cost increase. Match active to keep cache
+		// hot, or override per-iteration in clem.yaml directly.
+		SleepNight:      iterSec,
 		AlertChannel:    alertChannel,
 		AlertCurl:       alertCurl,
 		WatchChannelIDs: discordWatchChannels(cfg),
