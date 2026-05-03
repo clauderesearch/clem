@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jahwag/clem/internal/config"
 )
 
 // stubExec records invocations and returns canned responses. Replaces sys in tests
@@ -892,4 +894,103 @@ func equalSlice(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func TestWriteHostManagedSettings_WritesDenyList(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "etc", "claude-code", "managed-settings.json")
+
+	cfg := &config.Config{
+		Project: "test",
+		Agents: map[string]config.AgentConfig{
+			"lead": {Permissions: config.PermissionsConfig{Deny: []string{"Bash(curl:*)", "Bash(wget:*)"}}},
+			"worker": {Permissions: config.PermissionsConfig{Deny: []string{"Bash(rm:*)", "Bash(curl:*)"}}},
+		},
+	}
+
+	if err := WriteHostManagedSettings(cfg, path); err != nil {
+		t.Fatalf("WriteHostManagedSettings: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("managed-settings.json not written: %v", err)
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	perms, ok := doc["permissions"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected permissions object, got: %v", doc)
+	}
+	deny, ok := perms["deny"].([]any)
+	if !ok {
+		t.Fatalf("expected deny array, got: %v", perms)
+	}
+
+	// curl appears in both agents but must deduplicate; result sorted.
+	wantDenies := []string{"Bash(curl:*)", "Bash(rm:*)", "Bash(wget:*)"}
+	if len(deny) != len(wantDenies) {
+		t.Fatalf("expected %d deny entries, got %d: %v", len(wantDenies), len(deny), deny)
+	}
+	for i, want := range wantDenies {
+		if deny[i] != want {
+			t.Errorf("deny[%d] = %q, want %q", i, deny[i], want)
+		}
+	}
+}
+
+func TestWriteHostManagedSettings_EmptyDenyWhenNoPermissions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "managed-settings.json")
+
+	cfg := &config.Config{
+		Project: "test",
+		Agents: map[string]config.AgentConfig{
+			"lead": {Name: "Lead"},
+		},
+	}
+
+	if err := WriteHostManagedSettings(cfg, path); err != nil {
+		t.Fatalf("WriteHostManagedSettings: %v", err)
+	}
+
+	data, _ := os.ReadFile(path)
+	var doc map[string]any
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	perms := doc["permissions"].(map[string]any)
+	deny := perms["deny"].([]any)
+	if len(deny) != 0 {
+		t.Errorf("expected empty deny list, got: %v", deny)
+	}
+}
+
+func TestWriteHostManagedSettings_Idempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "managed-settings.json")
+	cfg := &config.Config{
+		Project: "test",
+		Agents: map[string]config.AgentConfig{
+			"lead": {Permissions: config.PermissionsConfig{Deny: []string{"Bash(curl:*)"}}},
+		},
+	}
+
+	if err := WriteHostManagedSettings(cfg, path); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	first, _ := os.ReadFile(path)
+
+	if err := WriteHostManagedSettings(cfg, path); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	second, _ := os.ReadFile(path)
+
+	if string(first) != string(second) {
+		t.Errorf("WriteHostManagedSettings not idempotent:\nfirst=%s\nsecond=%s", first, second)
+	}
 }
