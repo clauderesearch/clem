@@ -114,7 +114,10 @@ func WriteEnvFile(username, homeDir string, secrets map[string]string) error {
 
 	var sb strings.Builder
 	for k, v := range secrets {
-		sb.WriteString(fmt.Sprintf("export %s=%q\n", k, v))
+		// Single-quote the value so bash treats it as fully literal.
+		// Only ' needs escaping: end the quoted string, append literal ', reopen.
+		escaped := strings.ReplaceAll(v, "'", `'\''`)
+		sb.WriteString(fmt.Sprintf("export %s='%s'\n", k, escaped))
 	}
 
 	if err := os.WriteFile(envPath, []byte(sb.String()), 0600); err != nil {
