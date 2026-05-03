@@ -177,3 +177,100 @@ func TestRender_UnknownSubstitutionLeftUntouched(t *testing.T) {
 		t.Errorf("known key not substituted: %q", got)
 	}
 }
+
+func TestRender_OperatorSingleID(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		"CLAUDE.shared.md": "discord={{operator.discord_ids}} github={{operator.github_logins}}\n",
+	})
+	cfg := testCfg()
+	cfg.Operator = config.OperatorConfig{
+		DiscordIDs:   []string{"277434478803156993"},
+		GitHubLogins: []string{"jahwag"},
+	}
+
+	got, _, err := Render(cfg, "lead", dir)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	want := "discord=277434478803156993 github=jahwag\n"
+	if string(got) != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestRender_OperatorMultiIDs(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		"CLAUDE.shared.md": "trusted: {{operator.discord_ids}}\n",
+	})
+	cfg := testCfg()
+	cfg.Operator = config.OperatorConfig{
+		DiscordIDs: []string{"277434478803156993", "123456789012345678"},
+	}
+
+	got, _, err := Render(cfg, "lead", dir)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	want := "trusted: 277434478803156993, 123456789012345678\n"
+	if string(got) != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestRender_OperatorAbsentRendersEmpty(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		"CLAUDE.shared.md": "discord={{operator.discord_ids}} github={{operator.github_logins}}\n",
+	})
+
+	got, _, err := Render(testCfg(), "lead", dir)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	want := "discord= github=\n"
+	if string(got) != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestRender_OperatorDiscordOnly(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		"CLAUDE.shared.md": "discord={{operator.discord_ids}}\n",
+	})
+	cfg := testCfg()
+	cfg.Operator = config.OperatorConfig{
+		DiscordIDs: []string{"277434478803156993"},
+	}
+
+	got, _, err := Render(cfg, "lead", dir)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	want := "discord=277434478803156993\n"
+	if string(got) != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestRender_OperatorGitHubOnly(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		"CLAUDE.shared.md": "github={{operator.github_logins}}\n",
+	})
+	cfg := testCfg()
+	cfg.Operator = config.OperatorConfig{
+		GitHubLogins: []string{"jahwag"},
+	}
+
+	got, _, err := Render(cfg, "lead", dir)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	want := "github=jahwag\n"
+	if string(got) != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}

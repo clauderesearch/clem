@@ -88,6 +88,8 @@ func substitute(content string, cfg *config.Config, agentKey string) string {
 		"{{agent.key}}", agentKey,
 		"{{agent.name}}", ac.Name,
 		"{{agent.role}}", ac.Role,
+		"{{operator.discord_ids}}", strings.Join(cfg.Operator.DiscordIDs, ", "),
+		"{{operator.github_logins}}", strings.Join(cfg.Operator.GitHubLogins, ", "),
 	}
 	for name, id := range cfg.Coordination.Channels {
 		pairs = append(pairs, fmt.Sprintf("{{channels.%s}}", name), id)

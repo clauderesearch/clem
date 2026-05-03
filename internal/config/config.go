@@ -13,6 +13,26 @@ import (
 
 var validName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
 
+// snowflakeRe matches a Discord snowflake ID: 17–19 decimal digits.
+var snowflakeRe = regexp.MustCompile(`^[0-9]{17,19}$`)
+
+// githubLoginRe matches a valid GitHub username per GitHub's own rules.
+var githubLoginRe = regexp.MustCompile(`^[a-zA-Z0-9-]{1,39}$`)
+
+// OperatorConfig identifies the humans who are trusted to issue instructions
+// to agents via Discord or GitHub. Provisioned agents use these IDs in the
+// generated prompt so no operator ID is hardcoded in clem source.
+//
+// discord_ids must be 17–19-digit decimal Discord snowflakes.
+// github_logins must match ^[a-zA-Z0-9-]{1,39}$ (GitHub username rules).
+//
+// The block is optional. When omitted, {{operator.discord_ids}} and
+// {{operator.github_logins}} in CLAUDE.shared.md render as empty strings.
+type OperatorConfig struct {
+	DiscordIDs   []string `yaml:"discord_ids"`
+	GitHubLogins []string `yaml:"github_logins"`
+}
+
 // CavemanLevel controls whether and at what intensity the caveman plugin is
 // injected. Accepts "off"/""  (disabled), "lite", "full", "ultra", or the
 // legacy boolean true (→ "ultra") / false (→ "off").
@@ -65,6 +85,7 @@ type Config struct {
 	Project          string                 `yaml:"project"`
 	PrimaryMilestone string                 `yaml:"primary_milestone"`
 	Coordination     Coordination           `yaml:"coordination"`
+	Operator         OperatorConfig         `yaml:"operator"`
 	Agents           map[string]AgentConfig `yaml:"agents"`
 }
 
@@ -269,6 +290,9 @@ func Load(path string) (*Config, error) {
 	if _, err := coordination.Known(cfg.Coordination.Backend); err != nil {
 		return nil, err
 	}
+	if err := cfg.Operator.validate(); err != nil {
+		return nil, err
+	}
 	usedPorts := make(map[int]string)
 	for key, ac := range cfg.Agents {
 		if !validName.MatchString(key) {
@@ -296,6 +320,21 @@ func Load(path string) (*Config, error) {
 		cfg.Agents[key] = ac
 	}
 	return &cfg, nil
+}
+
+// validate checks that all discord_ids and github_logins are well-formed.
+func (op *OperatorConfig) validate() error {
+	for _, id := range op.DiscordIDs {
+		if !snowflakeRe.MatchString(id) {
+			return fmt.Errorf("operator.discord_ids: %q is not a valid Discord snowflake (17–19 decimal digits)", id)
+		}
+	}
+	for _, login := range op.GitHubLogins {
+		if !githubLoginRe.MatchString(login) {
+			return fmt.Errorf("operator.github_logins: %q is not a valid GitHub login (^[a-zA-Z0-9-]{1,39}$)", login)
+		}
+	}
+	return nil
 }
 
 // DefaultSubagentModel is applied when subagent_model is unset in clem.yaml.

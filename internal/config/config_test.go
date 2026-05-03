@@ -26,6 +26,8 @@ coordination:
   backend: discord
   server_id: "1"
   channels: {general: "g"}
+operator:
+  discord_ids: ["277434478803156993"]
 agents:
   lead:
     name: "Lead"
@@ -111,6 +113,8 @@ coordination:
   backend: discord
   server_id: "1"
   channels: {general: "g", tasks: "t"}
+operator:
+  discord_ids: ["277434478803156993"]
 agents:
   lead:
     name: "Amara"
@@ -133,6 +137,8 @@ coordination:
   backend: discord
   server_id: "1"
   channels: {general: "g"}
+operator:
+  discord_ids: ["277434478803156993"]
 agents:
   lead:
     name: "Amara"
@@ -158,6 +164,8 @@ coordination:
   backend: discord
   server_id: "1"
   channels: {general: "g"}
+operator:
+  discord_ids: ["277434478803156993"]
 agents:
   lead:
     name: "Lead"
@@ -204,6 +212,8 @@ coordination:
   backend: discord
   server_id: "1"
   channels: {general: "g"}
+operator:
+  discord_ids: ["277434478803156993"]
 agents:
   lead:
     name: "Lead"
@@ -227,6 +237,8 @@ coordination:
   backend: discord
   server_id: "1"
   channels: {general: "g"}
+operator:
+  discord_ids: ["277434478803156993"]
 agents:
   lead:
     name: "Lead"
@@ -250,6 +262,8 @@ coordination:
   backend: discord
   server_id: "1"
   channels: {general: "g"}
+operator:
+  discord_ids: ["277434478803156993"]
 agents:
   lead:
     name: "Ada"
@@ -279,5 +293,157 @@ func TestLoad_GitIdentityOptional(t *testing.T) {
 	ac := cfg.Agents["lead"]
 	if ac.GitName != "" || ac.GitEmail != "" {
 		t.Errorf("expected empty git identity when unset, got name=%q email=%q", ac.GitName, ac.GitEmail)
+	}
+}
+
+func TestLoad_OperatorParsed(t *testing.T) {
+	path := writeYAML(t, `
+project: myteam
+coordination:
+  backend: discord
+  server_id: "1"
+  channels: {general: "g"}
+operator:
+  discord_ids: ["277434478803156993"]
+  github_logins: ["jahwag"]
+agents:
+  lead:
+    name: "Lead"
+    model: "claude-sonnet-4-6"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Operator.DiscordIDs) != 1 || cfg.Operator.DiscordIDs[0] != "277434478803156993" {
+		t.Errorf("DiscordIDs = %v, want [277434478803156993]", cfg.Operator.DiscordIDs)
+	}
+	if len(cfg.Operator.GitHubLogins) != 1 || cfg.Operator.GitHubLogins[0] != "jahwag" {
+		t.Errorf("GitHubLogins = %v, want [jahwag]", cfg.Operator.GitHubLogins)
+	}
+}
+
+func TestLoad_OperatorMultiParsed(t *testing.T) {
+	path := writeYAML(t, `
+project: myteam
+coordination:
+  backend: discord
+  server_id: "1"
+  channels: {general: "g"}
+operator:
+  discord_ids: ["277434478803156993", "123456789012345678"]
+  github_logins: ["jahwag", "clauderesearch"]
+agents:
+  lead:
+    name: "Lead"
+    model: "claude-sonnet-4-6"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Operator.DiscordIDs) != 2 {
+		t.Errorf("DiscordIDs len = %d, want 2", len(cfg.Operator.DiscordIDs))
+	}
+	if len(cfg.Operator.GitHubLogins) != 2 {
+		t.Errorf("GitHubLogins len = %d, want 2", len(cfg.Operator.GitHubLogins))
+	}
+}
+
+func TestLoad_OperatorInvalidSnowflakeTooShort(t *testing.T) {
+	path := writeYAML(t, `
+project: myteam
+coordination:
+  backend: discord
+  server_id: "1"
+  channels: {general: "g"}
+operator:
+  discord_ids: ["1234"]
+agents:
+  lead:
+    name: "Lead"
+    model: "claude-sonnet-4-6"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for too-short snowflake, got nil")
+	}
+}
+
+func TestLoad_OperatorInvalidSnowflakeNonNumeric(t *testing.T) {
+	path := writeYAML(t, `
+project: myteam
+coordination:
+  backend: discord
+  server_id: "1"
+  channels: {general: "g"}
+operator:
+  discord_ids: ["abc12345678901234"]
+agents:
+  lead:
+    name: "Lead"
+    model: "claude-sonnet-4-6"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for non-numeric snowflake, got nil")
+	}
+}
+
+func TestLoad_OperatorInvalidLoginSpecialChars(t *testing.T) {
+	path := writeYAML(t, `
+project: myteam
+coordination:
+  backend: discord
+  server_id: "1"
+  channels: {general: "g"}
+operator:
+  github_logins: ["bad login!"]
+agents:
+  lead:
+    name: "Lead"
+    model: "claude-sonnet-4-6"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for login with special chars, got nil")
+	}
+}
+
+func TestLoad_OperatorInvalidLoginTooLong(t *testing.T) {
+	path := writeYAML(t, `
+project: myteam
+coordination:
+  backend: discord
+  server_id: "1"
+  channels: {general: "g"}
+operator:
+  github_logins: ["this-login-is-way-too-long-exceeds-39-chars-limit"]
+agents:
+  lead:
+    name: "Lead"
+    model: "claude-sonnet-4-6"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for login exceeding 39 chars, got nil")
+	}
+}
+
+func TestLoad_OperatorAbsentAllowed(t *testing.T) {
+	// Operator block is optional; absent block must not cause Load to fail.
+	path := writeYAML(t, `
+project: myteam
+agents:
+  lead:
+    name: "Lead"
+    model: "claude-sonnet-4-6"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Operator.DiscordIDs) != 0 || len(cfg.Operator.GitHubLogins) != 0 {
+		t.Errorf("expected empty operator when unset, got %+v", cfg.Operator)
 	}
 }
