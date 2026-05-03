@@ -293,9 +293,6 @@ func Load(path string) (*Config, error) {
 	if err := cfg.Operator.validate(); err != nil {
 		return nil, err
 	}
-	if cfg.Coordination.ServerID != "" && len(cfg.Operator.DiscordIDs) == 0 && len(cfg.Operator.GitHubLogins) == 0 {
-		return nil, fmt.Errorf("operator block required when coordination is configured: add operator.discord_ids or operator.github_logins to clem.yaml")
-	}
 	usedPorts := make(map[int]string)
 	for key, ac := range cfg.Agents {
 		if !validName.MatchString(key) {

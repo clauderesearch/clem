@@ -431,7 +431,7 @@ agents:
 }
 
 func TestLoad_OperatorAbsentAllowed(t *testing.T) {
-	// Operator block is optional when no coordination backend is configured.
+	// Operator block is optional; absent block must not cause Load to fail.
 	path := writeYAML(t, `
 project: myteam
 agents:
@@ -445,24 +445,5 @@ agents:
 	}
 	if len(cfg.Operator.DiscordIDs) != 0 || len(cfg.Operator.GitHubLogins) != 0 {
 		t.Errorf("expected empty operator when unset, got %+v", cfg.Operator)
-	}
-}
-
-func TestLoad_OperatorRequiredWithCoordination(t *testing.T) {
-	// Operator block is required when coordination.server_id is set.
-	path := writeYAML(t, `
-project: myteam
-coordination:
-  backend: discord
-  server_id: "1"
-  channels: {general: "g"}
-agents:
-  lead:
-    name: "Lead"
-    model: "claude-sonnet-4-6"
-`)
-	_, err := Load(path)
-	if err == nil {
-		t.Fatal("expected error when operator block absent with coordination configured, got nil")
 	}
 }
