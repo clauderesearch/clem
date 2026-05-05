@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -904,6 +905,37 @@ func InstallExtensions(username, homeDir string, ext config.ExtensionsConfig, ca
 		}
 	}
 	return nil
+}
+
+// WriteHostManagedSettings writes the merged deny list from all agents in cfg
+// to path (typically /etc/claude-code/managed-settings.json). The file is
+// root-owned and cannot be overridden by agent users. Idempotent.
+func WriteHostManagedSettings(cfg *config.Config, path string) error {
+	seen := make(map[string]bool)
+	denies := []string{}
+	for _, ac := range cfg.Agents {
+		for _, d := range ac.Permissions.Deny {
+			if !seen[d] {
+				seen[d] = true
+				denies = append(denies, d)
+			}
+		}
+	}
+	sort.Strings(denies)
+	doc := map[string]any{
+		"permissions": map[string]any{
+			"deny": denies,
+		},
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("creating managed-settings dir: %w", err)
+	}
+	return os.WriteFile(path, out, 0644)
 }
 
 // LastLogLine returns the last non-empty line of a log file.

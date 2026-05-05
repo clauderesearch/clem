@@ -237,6 +237,13 @@ func runProvision(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("  installed %s\n", cfg.WatchdogTimerName())
 
+	// 7. Write host-level managed-settings.json (root-owned; agent users cannot override)
+	managedPath := "/etc/claude-code/managed-settings.json"
+	if err := agent.WriteHostManagedSettings(cfg, managedPath); err != nil {
+		return fmt.Errorf("writing managed-settings: %w", err)
+	}
+	fmt.Printf("\nwrote %s\n", managedPath)
+
 	fmt.Printf("\nProvisioning complete. Run 'clem login' then 'clem up'.\n")
 	return nil
 }

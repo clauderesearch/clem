@@ -98,6 +98,14 @@ type ExtensionsConfig struct {
 	MCPServers   []MCPServerConfig   `yaml:"mcp_servers"`
 }
 
+// PermissionsConfig declares opt-in deny rules written to the root-owned
+// /etc/claude-code/managed-settings.json at provision time. Deny lists from
+// all agents on the host are merged into one file (managed-settings is
+// host-level, not per-user). Empty or absent block = no clem-injected denies.
+type PermissionsConfig struct {
+	Deny []string `yaml:"deny"`
+}
+
 // ExpandVaultRefs replaces ${vault:BUCKET.KEY} refs in s using the flat
 // secrets map from vault.DecryptForAgent. Unresolvable refs are left as-is.
 func ExpandVaultRefs(s string, secrets map[string]string) string {
@@ -217,6 +225,17 @@ type AgentConfig struct {
 	// install for this agent at provision time. caveman: true is handled as a
 	// shorthand that prepends the caveman marketplace and plugin entries.
 	Extensions ExtensionsConfig `yaml:"extensions"`
+	// Permissions configures root-owned /etc/claude-code/managed-settings.json
+	// deny rules for this agent. managed-settings.json has higher precedence
+	// than the agent's own ~/.claude/settings.json and cannot be overridden by
+	// the agent user. Deny patterns are merged from all agents at provision time.
+	// Empty or absent block means no clem-injected denies for this agent.
+	//
+	// WARNING: Bash(...) arg-pattern denies are fragile — they do not catch
+	// equivalent invocations (env-var URLs, renamed remotes, aliased flags).
+	// For high-stakes constraints, add a PreToolUse hook in addition to or
+	// instead of deny patterns.
+	Permissions PermissionsConfig `yaml:"permissions"`
 	// EgressRestrictionExperimental adds systemd IPAddressDeny=any + IPAddressAllow
 	// rules to the agent service unit. EXPERIMENTAL — known limitations:
 	//
