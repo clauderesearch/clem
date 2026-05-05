@@ -612,6 +612,39 @@ func TestWriteEnvFile_WritesSecretsAndGitignore(t *testing.T) {
 	}
 }
 
+func TestWriteEnvFile_SingleQuotesSpecialChars(t *testing.T) {
+	withStub(t)
+	dir := t.TempDir()
+	// Values containing $, backtick, and ' must be written literally (no bash expansion).
+	secrets := map[string]string{
+		"DOLLAR":   "foo$bar",
+		"BACKTICK": "foo`bar`baz",
+		"QUOTE":    "it's here",
+	}
+
+	if err := WriteEnvFile("testuser", dir, secrets); err != nil {
+		t.Fatalf("WriteEnvFile: %v", err)
+	}
+
+	envData, err := os.ReadFile(filepath.Join(dir, ".env"))
+	if err != nil {
+		t.Fatalf(".env not written: %v", err)
+	}
+	envStr := string(envData)
+
+	// All values must use single-quote syntax so bash treats them as literals.
+	if !strings.Contains(envStr, "export DOLLAR='foo$bar'") {
+		t.Errorf("DOLLAR not single-quoted literally: %s", envStr)
+	}
+	if !strings.Contains(envStr, "export BACKTICK='foo`bar`baz'") {
+		t.Errorf("BACKTICK not single-quoted literally: %s", envStr)
+	}
+	// Single quote in value must be escaped as '\''
+	if !strings.Contains(envStr, `export QUOTE='it'\''s here'`) {
+		t.Errorf("QUOTE single-quote not escaped correctly: %s", envStr)
+	}
+}
+
 func TestConfigureGit_WritesSigningConfig(t *testing.T) {
 	withStub(t)
 	dir := t.TempDir()
