@@ -1,11 +1,21 @@
 package runner
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/jahwag/clem/internal/config"
 )
+
+// mockHome overrides userHomeLookup for a test, returning testHome for any user.
+// Returns a cleanup function that restores the original.
+func mockHome(t *testing.T, testHome string) {
+	t.Helper()
+	orig := userHomeLookup
+	userHomeLookup = func(_ string) (string, error) { return testHome, nil }
+	t.Cleanup(func() { userHomeLookup = orig })
+}
 
 func baseCfg(agentKey string, ac config.AgentConfig) *config.Config {
 	return &config.Config{
@@ -159,16 +169,19 @@ func TestGenerate_DisablesClaudeAIConnectorMCPs(t *testing.T) {
 }
 
 func TestGenerateService_EgressRestrictionEnabled(t *testing.T) {
+	mockHome(t, "/home/test-lead")
 	cfg := baseCfg("lead", config.AgentConfig{
-		Name:              "Lead",
-		Model:             "claude-opus-4-7",
-		Iteration:         "1m",
-		Prompt:            "do the thing",
+		Name:                          "Lead",
+		Model:                         "claude-opus-4-7",
+		Iteration:                     "1m",
+		Prompt:                        "do the thing",
 		EgressRestrictionExperimental: true,
 	})
 
-	out := GenerateService(cfg, "lead")
-
+	out, err := GenerateService(cfg, "lead")
+	if err != nil {
+		t.Fatalf("GenerateService: %v", err)
+	}
 	for _, want := range []string{"IPAddressDeny=any", "IPAddressAllow=localhost", "IPAddressAllow=140.82.112.0/20"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected %q in service unit, got:\n%s", want, out)
@@ -177,6 +190,7 @@ func TestGenerateService_EgressRestrictionEnabled(t *testing.T) {
 }
 
 func TestGenerateService_EgressRestrictionDisabled(t *testing.T) {
+	mockHome(t, "/home/test-lead")
 	cfg := baseCfg("lead", config.AgentConfig{
 		Name:      "Lead",
 		Model:     "claude-opus-4-7",
@@ -184,8 +198,10 @@ func TestGenerateService_EgressRestrictionDisabled(t *testing.T) {
 		Prompt:    "do the thing",
 	})
 
-	out := GenerateService(cfg, "lead")
-
+	out, err := GenerateService(cfg, "lead")
+	if err != nil {
+		t.Fatalf("GenerateService: %v", err)
+	}
 	if strings.Contains(out, "IPAddressDeny") {
 		t.Fatalf("expected no IPAddressDeny when egress_restriction unset, got:\n%s", out)
 	}
@@ -273,6 +289,7 @@ func TestGenerate_DiscordWatchSkippedForNonDiscordBackend(t *testing.T) {
 }
 
 func TestGenerateService_PullsTtydUp(t *testing.T) {
+	mockHome(t, "/home/test-worker")
 	cfg := baseCfg("worker", config.AgentConfig{
 		Name:      "Worker",
 		Model:     "claude-opus-4-7",
@@ -280,13 +297,72 @@ func TestGenerateService_PullsTtydUp(t *testing.T) {
 		Prompt:    "do the thing",
 	})
 
-	out := GenerateService(cfg, "worker")
-
+	out, err := GenerateService(cfg, "worker")
+	if err != nil {
+		t.Fatalf("GenerateService: %v", err)
+	}
 	// Wants= ensures starting clem-test-worker also pulls the ttyd sidecar.
 	// Without this, BindsTo+PartOf only propagate stops back, leaving the
 	// web terminal dead until the next provision.
 	want := "Wants=clem-ttyd-test-worker.service"
 	if !strings.Contains(out, want) {
 		t.Fatalf("expected %q in service unit, got:\n%s", want, out)
+	}
+}
+
+func TestGenerateService_HardeningDirectivesPresent(t *testing.T) {
+	mockHome(t, "/home/test-lead")
+	cfg := baseCfg("lead", config.AgentConfig{
+		Name: "Lead", Model: "claude-opus-4-7", Iteration: "1m", Prompt: "do the thing",
+	})
+	out, err := GenerateService(cfg, "lead")
+	if err != nil {
+		t.Fatalf("GenerateService: %v", err)
+	}
+	for _, want := range []string{
+		"NoNewPrivileges=yes",
+		"ProtectSystem=strict",
+		"ProtectHome=read-only",
+		"PrivateTmp=yes",
+		"ReadOnlyPaths=/home/test-lead/CLAUDE.md /home/test-lead/CLAUDE.local.md",
+		"ReadWritePaths=/home/test-lead/.claude /home/test-lead/.local/state /home/test-lead/test",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in service unit, got:\n%s", want, out)
+		}
+	}
+}
+
+func TestGenerateService_HardeningUsesAbsoluteHomePath(t *testing.T) {
+	const customHome = "/data/agents/custom-home"
+	mockHome(t, customHome)
+	cfg := baseCfg("lead", config.AgentConfig{
+		Name: "Lead", Model: "claude-opus-4-7", Iteration: "1m", Prompt: "do the thing",
+	})
+	out, err := GenerateService(cfg, "lead")
+	if err != nil {
+		t.Fatalf("GenerateService: %v", err)
+	}
+	if !strings.Contains(out, customHome) {
+		t.Errorf("expected absolute home path %q in service unit, got:\n%s", customHome, out)
+	}
+	if strings.Contains(out, "%h") {
+		t.Errorf("service unit must not contain %%h specifier, got:\n%s", out)
+	}
+}
+
+func TestGenerateService_MissingUserFails(t *testing.T) {
+	orig := userHomeLookup
+	userHomeLookup = func(username string) (string, error) {
+		return "", fmt.Errorf("user not found: %s", username)
+	}
+	t.Cleanup(func() { userHomeLookup = orig })
+
+	cfg := baseCfg("lead", config.AgentConfig{
+		Name: "Lead", Model: "claude-opus-4-7", Iteration: "1m", Prompt: "do the thing",
+	})
+	_, err := GenerateService(cfg, "lead")
+	if err == nil {
+		t.Fatal("expected error for missing user, got nil")
 	}
 }
