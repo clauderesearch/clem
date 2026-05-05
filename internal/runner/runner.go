@@ -2,12 +2,23 @@ package runner
 
 import (
 	"fmt"
+	"os/user"
 	"sort"
 	"strings"
 
 	"github.com/jahwag/clem/internal/config"
 	"github.com/jahwag/clem/internal/coordination"
 )
+
+// userHomeLookup returns the home directory for the named OS user.
+// Replaced in tests via package-level assignment.
+var userHomeLookup = func(username string) (string, error) {
+	u, err := user.Lookup(username)
+	if err != nil {
+		return "", fmt.Errorf("user %q not found: %w", username, err)
+	}
+	return u.HomeDir, nil
+}
 
 const runnerTemplate = `#!/bin/bash
 set -m
@@ -267,7 +278,7 @@ ExecStart=/usr/bin/tmux new-session -d -s {{.AgentKey}} {{.HomeDir}}/.local/bin/
 ExecStop=/usr/bin/tmux kill-session -t {{.AgentKey}}
 RemainAfterExit=yes
 Restart=no
-{{.EgressDirectives}}
+{{.HardeningDirectives}}{{.EgressDirectives}}
 [Install]
 WantedBy=multi-user.target
 `
@@ -333,7 +344,8 @@ type RunnerParams struct {
 	TtydBind          string
 	AlertChannel      string
 	AlertCurl         string
-	EgressDirectives  string
+	EgressDirectives    string
+	HardeningDirectives string
 	// WatchChannelIDs is the comma-separated list of Discord channel IDs the
 	// MCP server's gateway watcher should observe. Empty disables the watcher
 	// even when DISCORD_TOKEN is set, preserving the original tool-only mode.
@@ -398,22 +410,41 @@ func Generate(cfg *config.Config, agentKey string) string {
 	}
 }
 
+// buildHardeningDirectives returns the systemd filesystem hardening block for
+// an agent service. homeDir must come from os/user.Lookup — not %h, which
+// resolves to the service manager's home (root) in system units (systemd #12389).
+func buildHardeningDirectives(homeDir, project string) string {
+	return fmt.Sprintf(
+		"NoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=read-only\nPrivateTmp=yes\n"+
+			"ReadOnlyPaths=%s/CLAUDE.md %s/CLAUDE.local.md\n"+
+			"ReadWritePaths=%s/.claude %s/.local/state %s/%s\n",
+		homeDir, homeDir, homeDir, homeDir, homeDir, project,
+	)
+}
+
 // GenerateService renders the systemd service unit content for an agent.
-func GenerateService(cfg *config.Config, agentKey string) string {
+// Returns an error if the agent OS user does not exist on the host.
+func GenerateService(cfg *config.Config, agentKey string) (string, error) {
 	ac := cfg.Agents[agentKey]
+	osUser := cfg.OSUsername(agentKey)
+	homeDir, err := userHomeLookup(osUser)
+	if err != nil {
+		return "", fmt.Errorf("generating service for agent %s: %w", agentKey, err)
+	}
 	egress := ""
 	if ac.EgressRestrictionExperimental {
 		egress = egressDirectives
 	}
 	p := RunnerParams{
-		Project:          cfg.Project,
-		AgentKey:         agentKey,
-		AgentName:        ac.Name,
-		OSUser:           cfg.OSUsername(agentKey),
-		HomeDir:          fmt.Sprintf("/home/%s", cfg.OSUsername(agentKey)),
-		EgressDirectives: egress,
+		Project:             cfg.Project,
+		AgentKey:            agentKey,
+		AgentName:           ac.Name,
+		OSUser:              osUser,
+		HomeDir:             homeDir,
+		EgressDirectives:    egress,
+		HardeningDirectives: buildHardeningDirectives(homeDir, cfg.Project),
 	}
-	return renderTemplate(serviceTemplate, p)
+	return renderTemplate(serviceTemplate, p), nil
 }
 
 // GenerateTtydService renders the systemd service unit for the agent's web terminal.
@@ -453,6 +484,7 @@ func renderTemplate(tmpl string, p RunnerParams) string {
 		"{{.AlertCurl}}", p.AlertCurl,
 		"{{.SubagentExport}}", p.SubagentExport,
 		"{{.EgressDirectives}}", p.EgressDirectives,
+		"{{.HardeningDirectives}}", p.HardeningDirectives,
 		"{{.WatchChannelIDs}}", p.WatchChannelIDs,
 	)
 	return r.Replace(tmpl)

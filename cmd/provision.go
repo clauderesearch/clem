@@ -201,7 +201,10 @@ func runProvision(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  wrote %s\n", runnerPath)
 
 		// 5. Install systemd service
-		svcContent := runner.GenerateService(cfg, agentKey)
+		svcContent, err := runner.GenerateService(cfg, agentKey)
+		if err != nil {
+			return fmt.Errorf("generating service for %s: %w", agentKey, err)
+		}
 		if err := agent.InstallService(cfg, agentKey, svcContent); err != nil {
 			return fmt.Errorf("installing service for %s: %w", agentKey, err)
 		}
