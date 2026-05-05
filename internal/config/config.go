@@ -416,6 +416,12 @@ func Load(path string) (*Config, error) {
 			}
 			usedPorts[ac.WebTerminalPort] = key
 		}
+		switch ac.Effort {
+		case "", "low", "medium", "high":
+			// valid
+		default:
+			return nil, fmt.Errorf("agent %s: effort must be low, medium, or high, got %q", key, ac.Effort)
+		}
 		ac.normalizeSubagentModel()
 		if err := ac.validateExtensions(key); err != nil {
 			return nil, err
