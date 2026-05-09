@@ -694,7 +694,7 @@ agents:
 }
 
 func TestLoad_EffortValidValues(t *testing.T) {
-	for _, effort := range []string{"", "low", "medium", "high"} {
+	for _, effort := range []string{"", "low", "medium", "high", "xhigh", "max"} {
 		yaml := `
 project: myteam
 coordination:
