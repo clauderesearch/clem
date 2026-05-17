@@ -60,7 +60,8 @@ func TestGenerateScript_DiscordBackendAlertCurl(t *testing.T) {
 		`if [ -n "$DISCORD_TOKEN" ] && [ -n "111" ]; then`,
 		`https://discord.com/api/v10/channels/111/messages`,
 		`-H "Authorization: Bot $DISCORD_TOKEN"`,
-		`-d "{\"content\":\"$msg\"}"`,
+		`-d "{\"content\":\"$safe_msg\"}"`,
+		`safe_msg=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1])[1:-1])" "$msg" 2>/dev/null) || safe_msg=$msg`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("discord-backend script missing %q\n---\n%s", want, s)
@@ -85,7 +86,7 @@ func TestGenerateScript_SlackBackendAlertCurl(t *testing.T) {
 		`if [ -n "$SLACK_MCP_XOXP_TOKEN" ] && [ -n "111" ]; then`,
 		`https://slack.com/api/chat.postMessage`,
 		`-H "Authorization: Bearer $SLACK_MCP_XOXP_TOKEN"`,
-		`-d "{\"channel\":\"111\",\"text\":\"$msg\"}"`,
+		`-d "{\"channel\":\"111\",\"text\":\"$safe_msg\"}"`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("slack-backend script missing %q\n---\n%s", want, s)

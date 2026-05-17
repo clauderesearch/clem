@@ -24,6 +24,8 @@ mkdir -p "$COOLDOWN_DIR"
 
 send_alert() {
     local msg="$1"
+    local safe_msg
+    safe_msg=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1])[1:-1])" "$msg" 2>/dev/null) || safe_msg=$msg
     if [ -n "${{.TokenEnvVar}}" ] && [ -n "{{.AlertChannel}}" ]; then
         {{.AlertCurl}}
     fi
@@ -201,7 +203,7 @@ func GenerateScript(cfg *config.Config) string {
 	backend, _ := coordination.Known(cfg.Coordination.Backend) // validated at load time
 	// $msg is the bash local set by send_alert; AlertTemplate expands it at
 	// runtime so the curl body matches the per-backend wire format.
-	alertCurl := fmt.Sprintf(backend.AlertTemplate, alertChannel, "$msg")
+	alertCurl := fmt.Sprintf(backend.AlertTemplate, alertChannel, "$safe_msg")
 
 	var checks strings.Builder
 	for _, key := range keys {
