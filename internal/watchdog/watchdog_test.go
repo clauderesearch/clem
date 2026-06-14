@@ -231,3 +231,62 @@ func TestGenerateScript_NoAgentVaultCheckWhenEnvBackend(t *testing.T) {
 		t.Error("no agent-vault check expected under default env backend")
 	}
 }
+
+func TestGenerateScript_GitHubBackendAlertCurl(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Coordination.Backend = "github"
+	cfg.Coordination.GithubRepo = "owner/repo"
+	cfg.Coordination.Channels["alerts"] = "42"
+	s := GenerateScript(cfg)
+	for _, want := range []string{
+		`if [ -n "$GH_TOKEN" ] && [ -n "42" ]; then`,
+		`api.github.com/repos/owner/repo/issues/42/comments`,
+		`-H "Authorization: Bearer $GH_TOKEN"`,
+		`-d "{\"body\":\"$safe_msg\"}"`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("github-backend script missing %q\n---\n%s", want, s)
+		}
+	}
+	for _, deny := range []string{
+		`DISCORD_TOKEN`,
+		`discord.com/api/v10`,
+		`slack.com/api/chat.postMessage`,
+	} {
+		if strings.Contains(s, deny) {
+			t.Errorf("github-backend script must not contain %q\n---\n%s", deny, s)
+		}
+	}
+}
+
+func TestGenerateScript_TranscriptPrune(t *testing.T) {
+	cfg := baseCfg()
+	out := GenerateScript(cfg)
+	for _, want := range []string{
+		"prune_transcripts()",
+		`-name "*.jsonl" -mtime +30 -delete`,
+		"[0-9a-f]{8}-[0-9a-f]{4}",
+		"prune_transcripts\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in watchdog script", want)
+		}
+	}
+	if strings.Contains(out, "{{.AgentHomes}}") {
+		t.Errorf("AgentHomes placeholder not substituted")
+	}
+}
+
+func TestGenerateScript_StaleUsesNightDurationWhenLonger(t *testing.T) {
+	cfg := baseCfg()
+	for key, ac := range cfg.Agents {
+		ac.Iteration = "10m"
+		ac.IterationNight = "30m"
+		cfg.Agents[key] = ac
+	}
+	out := GenerateScript(cfg)
+	// 1800s night + 300s margin = 2100
+	if !strings.Contains(out, `"2100"`) {
+		t.Errorf("stale threshold should derive from iteration_night (2100), got:\n%s", out)
+	}
+}

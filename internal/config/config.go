@@ -78,6 +78,16 @@ var modelRe = regexp.MustCompile(`^[A-Za-z0-9._:/@-]+$`)
 // splits arguments — so only this conservative character set is allowed.
 var validBindRe = regexp.MustCompile(`^[0-9A-Za-z./:_-]+$`)
 
+// githubRepoRe matches owner/name for coordination.github_repo.
+var githubRepoRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?/[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$`)
+
+// issueNumberRe matches a GitHub issue number used in channels.alerts/lessons.
+var issueNumberRe = regexp.MustCompile(`^[1-9][0-9]*$`)
+
+// githubLabelRe matches a safe GitHub issue label for channels.tasks (injected
+// into generated bash). Rejects shell metacharacters; max 50 chars per GitHub.
+var githubLabelRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,49}$`)
+
 // OperatorConfig identifies the humans who are trusted to issue instructions
 // to agents via Discord or GitHub. Provisioned agents use these IDs in the
 // generated prompt so no operator ID is hardcoded in clem source.
@@ -172,9 +182,19 @@ type Config struct {
 }
 
 type Coordination struct {
-	Backend  string            `yaml:"backend"`
-	ServerID string            `yaml:"server_id"`
-	Channels map[string]string `yaml:"channels"`
+	Backend string `yaml:"backend"`
+	// ServerID is the Discord guild or Slack workspace ID. Unused for GitHub.
+	ServerID string `yaml:"server_id"`
+	// GithubRepo is owner/name for the task-board repo when backend is github.
+	GithubRepo string            `yaml:"github_repo"`
+	Channels   map[string]string `yaml:"channels"`
+}
+
+func (c *Coordination) BackendOrDefault() string {
+	if c.Backend == "" {
+		return "discord"
+	}
+	return c.Backend
 }
 
 type AgentConfig struct {
@@ -182,9 +202,15 @@ type AgentConfig struct {
 	Role  string `yaml:"role"`
 	Model string `yaml:"model"`
 	// Iteration is a Go-style duration string (e.g. "30s", "1m30s", "2h").
-	// Parsed via time.ParseDuration. Sleep between agent sessions; same
-	// value applies day and night. Default 5m.
-	Iteration       string   `yaml:"iteration"`
+	// Parsed via time.ParseDuration. Sleep between agent sessions during
+	// active hours (07-22 host time). Default 5m.
+	Iteration string `yaml:"iteration"`
+	// IterationNight is the sleep between sessions during night hours
+	// (22:00-07:00 host time). Same format as Iteration. Empty = match
+	// Iteration. On a Claude subscription the prompt-cache TTL is 1h,
+	// refreshed on access, so values up to ~45m keep session starts warm;
+	// longer values trade one cold start per gap for fewer idle wakeups.
+	IterationNight  string   `yaml:"iteration_night"`
 	Vaults          []string `yaml:"vaults"`
 	Prompt          string   `yaml:"prompt"`
 	WebTerminalPort int      `yaml:"web_terminal_port"`
@@ -391,6 +417,22 @@ func (ac AgentConfig) IterationDuration() (time.Duration, error) {
 	return d, nil
 }
 
+// IterationNightDuration returns the parsed night iteration period, falling
+// back to IterationDuration when iteration_night is unset.
+func (ac AgentConfig) IterationNightDuration() (time.Duration, error) {
+	if ac.IterationNight == "" {
+		return ac.IterationDuration()
+	}
+	d, err := time.ParseDuration(ac.IterationNight)
+	if err != nil {
+		return 0, fmt.Errorf("invalid iteration_night %q: %w (expected Go duration like 30s, 1m30s, 2h)", ac.IterationNight, err)
+	}
+	if d < time.Second {
+		return 0, fmt.Errorf("iteration_night %q is too small (minimum 1s)", ac.IterationNight)
+	}
+	return d, nil
+}
+
 // ProviderEnv returns env vars that should be exported for this agent based on
 // its provider selection. These are merged into /home/<user>/.env alongside
 // vault secrets at provision time.
@@ -493,6 +535,9 @@ func Load(path string) (*Config, error) {
 	if _, err := coordination.Known(cfg.Coordination.Backend); err != nil {
 		return nil, err
 	}
+	if err := cfg.Coordination.validate(); err != nil {
+		return nil, err
+	}
 	if err := cfg.Operator.validate(); err != nil {
 		return nil, err
 	}
@@ -565,6 +610,9 @@ func Load(path string) (*Config, error) {
 		if _, err := ac.IterationDuration(); err != nil {
 			return nil, fmt.Errorf("agent %s: %w", key, err)
 		}
+		if _, err := ac.IterationNightDuration(); err != nil {
+			return nil, fmt.Errorf("agent %s: %w", key, err)
+		}
 		if _, err := ac.ProviderEnv(); err != nil {
 			return nil, fmt.Errorf("agent %s: %w", key, err)
 		}
@@ -635,6 +683,31 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+func (c *Coordination) validate() error {
+	switch c.BackendOrDefault() {
+	case "github":
+		if c.GithubRepo == "" {
+			return fmt.Errorf("coordination.github_repo is required when backend is github")
+		}
+		if !githubRepoRe.MatchString(c.GithubRepo) {
+			return fmt.Errorf("coordination.github_repo: %q is not a valid owner/name repo slug", c.GithubRepo)
+		}
+		for _, key := range []string{"alerts", "lessons"} {
+			if v := strings.TrimSpace(c.Channels[key]); v != "" && !issueNumberRe.MatchString(v) {
+				return fmt.Errorf("coordination.channels.%s: %q must be a GitHub issue number when backend is github", key, v)
+			}
+		}
+		v := strings.TrimSpace(c.Channels["tasks"])
+		if v == "" {
+			return fmt.Errorf("coordination.channels.tasks is required when backend is github (use a label such as clem:todo)")
+		}
+		if !githubLabelRe.MatchString(v) {
+			return fmt.Errorf("coordination.channels.tasks: %q is not a valid GitHub label (use letters, digits, :, _, - only)", v)
+		}
+	}
+	return nil
 }
 
 // validate checks that all discord_ids and github_logins are well-formed.

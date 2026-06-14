@@ -57,6 +57,7 @@ export CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL=1
 # built against. Pre-0.9.5 hardcoded /usr/local/bin and broke every time
 # system Python state drifted, requiring jahwag to re-edit .mcp.json every
 # iteration because the runner overwrites it.
+_backend = '{{.CoordinationBackend}}'
 python3 -c "
 import json, os
 def _mcp_bin(name):
@@ -67,7 +68,8 @@ cfg = {'mcpServers': {}}
 # Discord bot. When channel IDs are configured the MCP server also runs a
 # gateway watcher that pushes one debounced notification per burst into this
 # agent's tmux session — see mcp-discord's CLEM_TMUX_TARGET docs.
-if os.environ.get('DISCORD_TOKEN'):
+# Skipped when coordination backend is github (agents use gh CLI instead).
+if _backend != 'github' and os.environ.get('DISCORD_TOKEN'):
     _discord_env = {'DISCORD_TOKEN': os.environ['DISCORD_TOKEN']}
     _watch = '{{.WatchChannelIDs}}'
     if _watch:
@@ -85,7 +87,7 @@ if os.environ.get('DISCORD_TOKEN'):
 # slack-mcp-server is a Go binary (not Python) so the pipx fallback does
 # not apply; we still resolve it through _mcp_bin for symmetry / future-
 # proofing in case the upstream ships a Python version.
-if os.environ.get('SLACK_MCP_XOXP_TOKEN'):
+if _backend != 'github' and os.environ.get('SLACK_MCP_XOXP_TOKEN'):
     slack_args = ['--transport', 'stdio']
     if os.environ.get('SLACK_MCP_ENABLED_TOOLS'):
         slack_args += ['--enabled-tools', os.environ['SLACK_MCP_ENABLED_TOOLS']]
@@ -126,6 +128,7 @@ MAX_LESSONS_MESSAGES=25
 while true; do
     START=$(date +%s)
     PROMPT='{{.Prompt}}'
+    RUNNER_WARNINGS=""
 
     # Guard: CLAUDE.local.md too large (token waste)
     if [ -f "$WORKDIR/CLAUDE.local.md" ]; then
@@ -141,6 +144,58 @@ while true; do
     "$CLAUDE" install 2>&1 | tail -5 | tee -a "$LOGFILE" || log "claude install failed, continuing with current version"
 
     {{.SkillsSyncCmd}}
+
+    # Surface a near-expired OAuth token to the agent itself: a dead token
+    # mid-session shows up as opaque 401/407 API errors otherwise.
+    EXP_MS=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.claude/.credentials.json'))).get('claudeAiOauth',{}).get('expiresAt',0))" 2>/dev/null || echo 0)
+    NOW_MS=$(( $(date +%s) * 1000 ))
+    if [ "$EXP_MS" -gt 0 ] 2>/dev/null && [ "$EXP_MS" -lt $(( NOW_MS + 3600000 )) ]; then
+        log "WARNING: OAuth token expires within 1h (or already expired)"
+        RUNNER_WARNINGS="${RUNNER_WARNINGS}[runner] Your OAuth token expires within 1h or is already expired; if you hit 401/407 API errors, escalate to the alerts channel. "
+    fi
+
+    # Per-agent quota snapshot (TTL 25m). Agents read this file instead of
+    # polling the OAuth usage endpoint every iteration, which rate-limits
+    # (429) when multiple agents on one host poll per-session.
+    QUOTA_FILE="$HOME/.claude/quota.json"
+    QUOTA_AGE=$(( $(date +%s) - $(stat -c %Y "$QUOTA_FILE" 2>/dev/null || echo 0) ))
+    if [ "$QUOTA_AGE" -gt 1500 ]; then
+        OAUTH_TOKEN=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.claude/.credentials.json')))['claudeAiOauth']['accessToken'])" 2>/dev/null)
+        if [ -n "$OAUTH_TOKEN" ]; then
+            HTTP_CODE=$(curl -sS -m 15 -o "$QUOTA_FILE.tmp" -w "%{http_code}" \
+                -H "Authorization: Bearer $OAUTH_TOKEN" \
+                -H "anthropic-beta: oauth-2025-04-20" \
+                https://api.anthropic.com/api/oauth/usage 2>>"$LOGFILE")
+            if [ "$HTTP_CODE" = "200" ]; then
+                mv "$QUOTA_FILE.tmp" "$QUOTA_FILE"
+                log "Quota snapshot refreshed"
+            else
+                rm -f "$QUOTA_FILE.tmp"
+                log "Quota snapshot fetch failed (HTTP ${HTTP_CODE}); keeping previous snapshot"
+            fi
+            unset OAUTH_TOKEN
+        fi
+    fi
+
+    # Per-iteration effort override: the agent writes low|medium|high|xhigh
+    # to ~/.claude/next-effort during an iteration; consumed (and deleted)
+    # here. CLAUDE_CODE_EFFORT_LEVEL is session-scoped and outranks settings
+    # files, so an absent file simply means settings.json effortLevel
+    # applies — no reset bookkeeping, no drift across iterations.
+    unset CLAUDE_CODE_EFFORT_LEVEL
+    if [ -f "$HOME/.claude/next-effort" ]; then
+        NEXT_EFFORT=$(tr -cd 'a-z' < "$HOME/.claude/next-effort" | head -c 16)
+        rm -f "$HOME/.claude/next-effort"
+        case "$NEXT_EFFORT" in
+            low|medium|high|xhigh)
+                export CLAUDE_CODE_EFFORT_LEVEL="$NEXT_EFFORT"
+                log "Effort override for this session: $NEXT_EFFORT" ;;
+            *)
+                log "Ignoring invalid next-effort value: $NEXT_EFFORT" ;;
+        esac
+    fi
+
+    [ -n "$RUNNER_WARNINGS" ] && PROMPT="${RUNNER_WARNINGS}${PROMPT}"
 
     log "Starting {{.AgentName}} (fresh session)"
     (sleep 1 && tmux send-keys -t {{.AgentKey}} "" Enter
@@ -199,6 +254,7 @@ tail -500 "$LOGFILE" > "$LOGFILE.tmp" 2>/dev/null && mv "$LOGFILE.tmp" "$LOGFILE
 # Write opencode.json with Ollama provider + discord-bot MCP (if token is set).
 # MCP binary paths come from _mcp_bin (pipx-isolated venv preferred over system
 # pip install — see the claude-code runner template above for the rationale).
+_backend = '{{.CoordinationBackend}}'
 python3 -c "
 import json, os
 def _mcp_bin(name):
@@ -218,7 +274,7 @@ if os.environ.get('ANTHROPIC_MODEL'):
         'options': {'baseURL': base_url},
         'models': {os.environ['ANTHROPIC_MODEL']: {}},
     }
-if os.environ.get('DISCORD_TOKEN'):
+if _backend != 'github' and os.environ.get('DISCORD_TOKEN'):
     _discord_env = {'DISCORD_TOKEN': os.environ['DISCORD_TOKEN']}
     _watch = '{{.WatchChannelIDs}}'
     if _watch:
@@ -230,7 +286,7 @@ if os.environ.get('DISCORD_TOKEN'):
         'enabled': True,
         'environment': _discord_env,
     }
-if os.environ.get('SLACK_MCP_XOXP_TOKEN'):
+if _backend != 'github' and os.environ.get('SLACK_MCP_XOXP_TOKEN'):
     slack_cmd = [_mcp_bin('slack-mcp-server'), '--transport', 'stdio']
     if os.environ.get('SLACK_MCP_ENABLED_TOOLS'):
         slack_cmd += ['--enabled-tools', os.environ['SLACK_MCP_ENABLED_TOOLS']]
@@ -254,6 +310,7 @@ MAX_LESSONS_MESSAGES=25
 while true; do
     START=$(date +%s)
     PROMPT='{{.Prompt}}'
+    RUNNER_WARNINGS=""
 
     # Guard: CLAUDE.local.md too large (token waste)
     if [ -f "$WORKDIR/CLAUDE.local.md" ]; then
@@ -266,6 +323,8 @@ while true; do
     fi
 
     {{.SkillsSyncCmd}}
+
+    [ -n "$RUNNER_WARNINGS" ] && PROMPT="${RUNNER_WARNINGS}${PROMPT}"
 
     log "Starting {{.AgentName}} (opencode, fresh session)"
     MODEL_ARG=""
@@ -306,6 +365,7 @@ After=network.target
 # start, so without a Wants here a "systemctl start" of the agent leaves the
 # terminal dead until provision re-enables it.
 Wants=clem-ttyd-{{.Project}}-{{.AgentKey}}.service
+{{.GitHubWatchUnitDeps}}
 {{.ProxyUnitDeps}}
 [Service]
 Type=forking
@@ -389,6 +449,11 @@ type RunnerParams struct {
 	// SidecarServers is a Python/JSON list literal of [toolName, port] pairs for
 	// the privileged MCP sidecars this agent subscribes to. "[]" when none.
 	SidecarServers string
+	// CoordinationBackend is the coordination.backend value (discord, slack, github).
+	CoordinationBackend string
+	// GitHubWatchUnitDeps is the Wants= block tying the agent to the GitHub
+	// issue watcher sidecar when coordination.backend is github.
+	GitHubWatchUnitDeps string
 	// SkillsSyncCmd is the shell snippet invoked at the top of every iteration
 	// to refresh the agent's ~/.claude/skills/ symlinks from the team skills
 	// repo. Empty when cfg.SkillsRepo is unset, in which case no sync runs.
@@ -418,6 +483,8 @@ func Generate(cfg *config.Config, agentKey string) string {
 	ac := cfg.Agents[agentKey]
 	iterDur, _ := ac.IterationDuration() // validated at load time
 	iterSec := int(iterDur.Seconds())
+	nightDur, _ := ac.IterationNightDuration() // validated at load time
+	nightSec := int(nightDur.Seconds())
 
 	// Render {{agent.name}}, {{channels.*}}, etc. in the operator-authored
 	// prompt the same way CLAUDE.local.md is rendered. Without this, agents
@@ -439,7 +506,12 @@ func Generate(cfg *config.Config, agentKey string) string {
 	alertChannel := cfg.Coordination.Channels["alerts"]
 	backend, _ := coordination.Known(cfg.Coordination.Backend) // validated at load time
 	alertMsg := fmt.Sprintf(`⚠️ %s: CLAUDE.local.md is ${SIZE} bytes (>${MAX_CLAUDE_MD_BYTES}). Trim it to reduce token waste.`, escapeForAlert(ac.Name))
-	alertCurl := fmt.Sprintf(`[ -n "$%s" ] && %s`, backend.TokenEnvVar, fmt.Sprintf(backend.AlertTemplate, alertChannel, alertMsg))
+	alertCurlBody := coordination.RenderAlert(backend, coordination.AlertParams{
+		Repo:    cfg.Coordination.GithubRepo,
+		Channel: alertChannel,
+		Message: alertMsg,
+	})
+	alertCurl := coordination.AlertCurlGuard(backend, alertChannel, alertCurlBody)
 
 	subagentExport := ""
 	if ac.SubagentModel != "" {
@@ -447,8 +519,17 @@ func Generate(cfg *config.Config, agentKey string) string {
 	}
 	skillsSyncCmd := ""
 	if cfg.SkillsRepo != "" {
+		// PIPESTATUS, not ||: without pipefail, `sync | tee || log` reacts to
+		// tee's exit status, so sync failures were silently swallowed (bit a
+		// production host for 3 weeks: a dirty clone blocked every pull and
+		// the "skills sync failed" branch never fired). The warning is also
+		// prepended to the agent's prompt so the agent itself escalates.
 		skillsSyncCmd = fmt.Sprintf(
-			`clem sync-skills --home "$HOME" --agent-key %q --repo %q 2>&1 | tee -a "$LOGFILE" || log "skills sync failed"`,
+			`clem sync-skills --home "$HOME" --agent-key %q --repo %q 2>&1 | tee -a "$LOGFILE"
+    if [ "${PIPESTATUS[0]}" != "0" ]; then
+        log "skills sync failed"
+        RUNNER_WARNINGS="${RUNNER_WARNINGS}[runner] Skills sync FAILED this iteration; your skills may be stale. Check ~/.cache for a dirty clone or auth failure, fix or escalate to the alerts channel. "
+    fi`,
 			agentKey, cfg.SkillsRepo,
 		)
 	}
@@ -461,19 +542,21 @@ func Generate(cfg *config.Config, agentKey string) string {
 		Prompt:         strings.ReplaceAll(promptText, "'", `'\''`),
 		OSUser:         cfg.OSUsername(agentKey),
 		HomeDir:        fmt.Sprintf("/home/%s", cfg.OSUsername(agentKey)),
-		SleepActive:    iterSec,
-		// Night sleep matches active. The previous 2x doubler hurt spend:
-		// Anthropic's prompt cache TTL is 5 min, so any iter > 5m at night
-		// guaranteed a cache miss every session — same session count cut
-		// you'd get from cold-cache cost increase. Match active to keep cache
-		// hot, or override per-iteration in clem.yaml directly.
-		SleepNight:      iterSec,
-		AlertChannel:    alertChannel,
-		AlertCurl:       alertCurl,
-		WatchChannelIDs: discordWatchChannels(cfg),
-		ProxyExport:     proxyExportBlock(cfg, agentKey),
-		SidecarServers:  sidecarServersLiteral(cfg, agentKey),
-		SkillsSyncCmd:   skillsSyncCmd,
+		SleepActive: iterSec,
+		// Night sleep defaults to the active value; iteration_night overrides.
+		// History: a hardcoded 2x night doubler was removed on the belief the
+		// prompt-cache TTL was 5 min. Subscription Claude Code actually gets
+		// the 1h TTL, refreshed on access (verified against session-log usage
+		// fields, 2026-06-13), so night intervals up to ~45m still start warm.
+		SleepNight:          nightSec,
+		AlertChannel:        alertChannel,
+		AlertCurl:           alertCurl,
+		WatchChannelIDs:     watchChannelIDs(cfg),
+		CoordinationBackend: cfg.Coordination.BackendOrDefault(),
+		GitHubWatchUnitDeps: githubWatchUnitDeps(cfg, agentKey),
+		ProxyExport:         proxyExportBlock(cfg, agentKey),
+		SidecarServers:      sidecarServersLiteral(cfg, agentKey),
+		SkillsSyncCmd:       skillsSyncCmd,
 	}
 	switch ac.RuntimeKind() {
 	case "opencode":
@@ -583,6 +666,7 @@ func GenerateService(cfg *config.Config, agentKey string) (string, error) {
 		HardeningDirectives: buildHardeningDirectives(homeDir, cfg.Project),
 		ResourceDirectives:  ac.ResourceLimits.Directives(),
 		ProxyUnitDeps:       proxyDeps,
+		GitHubWatchUnitDeps: githubWatchUnitDeps(cfg, agentKey),
 	}
 	return renderTemplate(serviceTemplate, p), nil
 }
@@ -630,6 +714,8 @@ func renderTemplate(tmpl string, p RunnerParams) string {
 		"{{.ProxyExport}}", p.ProxyExport,
 		"{{.ProxyUnitDeps}}", p.ProxyUnitDeps,
 		"{{.SidecarServers}}", p.SidecarServers,
+		"{{.CoordinationBackend}}", p.CoordinationBackend,
+		"{{.GitHubWatchUnitDeps}}", p.GitHubWatchUnitDeps,
 		"{{.SkillsSyncCmd}}", p.SkillsSyncCmd,
 	)
 	return r.Replace(tmpl)
@@ -651,12 +737,11 @@ func sidecarServersLiteral(cfg *config.Config, agentKey string) string {
 	return "[" + strings.Join(parts, ", ") + "]"
 }
 
-// discordWatchChannels returns a deterministic comma-separated list of
-// configured Discord channel IDs for the gateway watcher to observe.
-// Sorted by channel name (the map key) so renders are stable across
-// Go map-iteration orderings, which keeps generated runner.sh diffs
-// minimal between provisions.
-func discordWatchChannels(cfg *config.Config) string {
+// watchChannelIDs returns coordination-backend-specific watcher configuration
+// injected into the MCP generator. Discord: comma-separated channel IDs for
+// mcp-discord's gateway watcher. GitHub and Slack: empty (GitHub uses a
+// separate systemd sidecar; Slack has no push watcher yet).
+func watchChannelIDs(cfg *config.Config) string {
 	if cfg == nil {
 		return ""
 	}
@@ -666,16 +751,30 @@ func discordWatchChannels(cfg *config.Config) string {
 	if backend.Name != "discord" {
 		return ""
 	}
-	names := make([]string, 0, len(cfg.Coordination.Channels))
-	for name := range cfg.Coordination.Channels {
+	return sortedChannelIDs(cfg.Coordination.Channels)
+}
+
+// sortedChannelIDs returns a deterministic comma-separated list of configured
+// channel IDs. Sorted by channel name so renders are stable across Go map
+// iteration orderings.
+func sortedChannelIDs(channels map[string]string) string {
+	names := make([]string, 0, len(channels))
+	for name := range channels {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	ids := make([]string, 0, len(names))
 	for _, name := range names {
-		if id := strings.TrimSpace(cfg.Coordination.Channels[name]); id != "" {
+		if id := strings.TrimSpace(channels[name]); id != "" {
 			ids = append(ids, id)
 		}
 	}
 	return strings.Join(ids, ",")
+}
+
+func githubWatchUnitDeps(cfg *config.Config, agentKey string) string {
+	if cfg == nil || !cfg.UsesGitHubCoordination() {
+		return ""
+	}
+	return fmt.Sprintf("Wants=%s\n", cfg.GitHubWatchServiceName(agentKey))
 }

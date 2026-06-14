@@ -739,6 +739,93 @@ func TestSidecarServersLiteral(t *testing.T) {
 	}
 }
 
+func TestGenerate_GitHubBackendAlertCurl(t *testing.T) {
+	cfg := &config.Config{
+		Project: "test",
+		Coordination: config.Coordination{
+			Backend:    "github",
+			GithubRepo: "owner/tasks",
+			Channels: map[string]string{
+				"alerts": "99",
+			},
+		},
+		Agents: map[string]config.AgentConfig{
+			"worker": {
+				Name:      "Worker",
+				Model:     "claude-opus-4-7",
+				Iteration: "1m",
+				Prompt:    "do the thing",
+			},
+		},
+	}
+	out := Generate(cfg, "worker")
+	for _, want := range []string{
+		`[ -n "$GH_TOKEN" ]`,
+		`api.github.com/repos/owner/tasks/issues/99/comments`,
+		`Authorization: Bearer $GH_TOKEN`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("github runner missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestGenerate_GitHubBackendSkipsChatMCP(t *testing.T) {
+	cfg := &config.Config{
+		Project: "test",
+		Coordination: config.Coordination{
+			Backend:    "github",
+			GithubRepo: "owner/tasks",
+			Channels: map[string]string{
+				"tasks": "clem:todo",
+			},
+		},
+		Agents: map[string]config.AgentConfig{
+			"worker": {
+				Name:      "Worker",
+				Model:     "claude-opus-4-7",
+				Iteration: "1m",
+				Prompt:    "do the thing",
+			},
+		},
+	}
+	out := Generate(cfg, "worker")
+	if !strings.Contains(out, `_backend = 'github'`) {
+		t.Fatalf("expected coordination backend in mcp generator:\n%s", out)
+	}
+	if !strings.Contains(out, `if _backend != 'github' and os.environ.get('DISCORD_TOKEN'):`) {
+		t.Fatalf("expected discord MCP guarded for github backend:\n%s", out)
+	}
+}
+
+func TestGenerateService_GitHubWatchUnitDeps(t *testing.T) {
+	mockHome(t, "/home/test-worker")
+	cfg := &config.Config{
+		Project: "test",
+		Coordination: config.Coordination{
+			Backend:    "github",
+			GithubRepo: "acme/tasks",
+			Channels:   map[string]string{"tasks": "clem:todo", "alerts": "1"},
+		},
+		Agents: map[string]config.AgentConfig{
+			"worker": {
+				Name:      "Worker",
+				Model:     "claude-opus-4-7",
+				Iteration: "1m",
+				Prompt:    "do the thing",
+			},
+		},
+	}
+	out, err := GenerateService(cfg, "worker")
+	if err != nil {
+		t.Fatalf("GenerateService: %v", err)
+	}
+	want := "Wants=clem-github-watch-test-worker.service"
+	if !strings.Contains(out, want) {
+		t.Fatalf("expected %q in service unit:\n%s", want, out)
+	}
+}
+
 func TestGenerate_SkillsSyncInjectedWhenRepoSet(t *testing.T) {
 	cfg := baseCfg("worker", config.AgentConfig{
 		Name:      "Athena",
@@ -766,5 +853,61 @@ func TestGenerate_SkillsSyncAbsentWhenRepoUnset(t *testing.T) {
 	out := Generate(cfg, "worker")
 	if strings.Contains(out, "clem sync-skills") {
 		t.Errorf("runner should not invoke sync-skills when SkillsRepo unset; got:\n%s", out)
+	}
+}
+
+func TestGenerate_NightSleepDefaultsToIteration(t *testing.T) {
+	cfg := baseCfg("lead", config.AgentConfig{Name: "L", Iteration: "10m", Prompt: "p"})
+	out := Generate(cfg, "lead")
+	if !strings.Contains(out, "SLEEP_ACTIVE=600") || !strings.Contains(out, "SLEEP_NIGHT=600") {
+		t.Errorf("expected both sleeps 600, got:\n%s", out)
+	}
+}
+
+func TestGenerate_NightSleepFromIterationNight(t *testing.T) {
+	cfg := baseCfg("lead", config.AgentConfig{Name: "L", Iteration: "10m", IterationNight: "30m", Prompt: "p"})
+	out := Generate(cfg, "lead")
+	if !strings.Contains(out, "SLEEP_ACTIVE=600") || !strings.Contains(out, "SLEEP_NIGHT=1800") {
+		t.Errorf("expected active 600 night 1800, got:\n%s", out)
+	}
+}
+
+func TestGenerate_NextEffortAndQuotaBlocks(t *testing.T) {
+	cfg := baseCfg("lead", config.AgentConfig{Name: "L", Iteration: "1m", Prompt: "p"})
+	out := Generate(cfg, "lead")
+	for _, want := range []string{
+		`if [ -f "$HOME/.claude/next-effort" ]`,
+		`export CLAUDE_CODE_EFFORT_LEVEL="$NEXT_EFFORT"`,
+		"unset CLAUDE_CODE_EFFORT_LEVEL",
+		`QUOTA_FILE="$HOME/.claude/quota.json"`,
+		"api.anthropic.com/api/oauth/usage",
+		`PROMPT="${RUNNER_WARNINGS}${PROMPT}"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in claude runner", want)
+		}
+	}
+	// opencode runtime gets warnings prepend but no effort/quota machinery
+	cfg = baseCfg("lead", config.AgentConfig{Name: "L", Iteration: "1m", Prompt: "p", Runtime: "opencode"})
+	out = Generate(cfg, "lead")
+	if strings.Contains(out, "next-effort") || strings.Contains(out, "QUOTA_FILE") {
+		t.Errorf("opencode runner should not contain effort/quota blocks")
+	}
+	if !strings.Contains(out, `PROMPT="${RUNNER_WARNINGS}${PROMPT}"`) {
+		t.Errorf("opencode runner missing warnings prepend")
+	}
+}
+
+func TestGenerate_SkillsSyncFailureUsesPipestatusAndWarns(t *testing.T) {
+	cfg := baseCfg("lead", config.AgentConfig{Name: "L", Iteration: "1m", Prompt: "p"})
+	cfg.SkillsRepo = "https://example.com/skills"
+	out := Generate(cfg, "lead")
+	for _, want := range []string{
+		`if [ "${PIPESTATUS[0]}" != "0" ]`,
+		"Skills sync FAILED this iteration",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in runner with skills repo", want)
+		}
 	}
 }
