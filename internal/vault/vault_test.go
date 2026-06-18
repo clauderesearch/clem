@@ -220,6 +220,62 @@ func TestDelete_RejectsInvalidKeyName(t *testing.T) {
 	}
 }
 
+func TestSet_RejectsInvalidVaultName(t *testing.T) {
+	for _, name := range []string{
+		"shared // .vaults",
+		"../escape",
+		"UPPER",
+		"has space",
+		"",
+		"a|b",
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := Set(name, "KEY=value")
+			if err == nil {
+				t.Fatalf("Set(%q) expected error for invalid vault name", name)
+			}
+			if !strings.Contains(err.Error(), "vault name") {
+				t.Errorf("Set(%q) error = %v, want vault name validation message", name, err)
+			}
+		})
+	}
+}
+
+func TestGet_RejectsInvalidVaultName(t *testing.T) {
+	err := Get("shared // .vaults", "KEY")
+	if err == nil {
+		t.Fatal("expected error for injection vault name")
+	}
+	if !strings.Contains(err.Error(), "vault name") {
+		t.Errorf("got: %v", err)
+	}
+}
+
+func TestDelete_RejectsInvalidVaultName(t *testing.T) {
+	err := Delete("has|pipe", "")
+	if err == nil {
+		t.Fatal("expected error for invalid vault name")
+	}
+	if !strings.Contains(err.Error(), "vault name") {
+		t.Errorf("got: %v", err)
+	}
+}
+
+func TestDecryptForAgent_RejectsInvalidVaultName(t *testing.T) {
+	cleanup := setupVaultDir(t)
+	defer cleanup()
+
+	// The attack from issue #122: a vault name with yq alternative operator
+	// falls back to the entire .vaults subtree, leaking all secrets.
+	_, err := DecryptForAgent("lead", []string{"shared // .vaults"})
+	if err == nil {
+		t.Fatal("expected error for yq-injection vault name")
+	}
+	if !strings.Contains(err.Error(), "vault name") {
+		t.Errorf("got: %v", err)
+	}
+}
+
 func TestJqEscape(t *testing.T) {
 	cases := []struct {
 		input string

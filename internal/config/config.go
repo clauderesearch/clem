@@ -646,6 +646,11 @@ func Load(path string) (*Config, error) {
 		if ac.EgressRestrictionExperimental {
 			fmt.Fprintf(os.Stderr, "warning: agent %s: egress_restriction_experimental is deprecated — use the top-level egress: block (pipelock + nftables containment)\n", key)
 		}
+		for _, vaultName := range ac.Vaults {
+			if !validName.MatchString(vaultName) {
+				return nil, fmt.Errorf("agent %s: vault name %q must match ^[a-z][a-z0-9-]{0,30}$", key, vaultName)
+			}
+		}
 		if ac.VaultBroker {
 			if !cfg.Vault.IsAgentVault() {
 				return nil, fmt.Errorf("agent %s: vault_broker requires vault.backend: agent-vault", key)

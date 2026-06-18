@@ -452,6 +452,60 @@ func TestLoad_VaultBackends_BadNameRejected(t *testing.T) {
 	}
 }
 
+func TestLoad_AgentVaultNamesValidated(t *testing.T) {
+	bad := []string{
+		"shared // .vaults",
+		"UPPER",
+		"has space",
+		"has|pipe",
+	}
+	for _, name := range bad {
+		t.Run(name, func(t *testing.T) {
+			path := writeYAML(t, `
+project: myteam
+coordination:
+  backend: discord
+  server_id: "1"
+  channels: {general: "g"}
+operator:
+  discord_ids: ["277434478803156993"]
+agents:
+  lead:
+    name: "Lead"
+    model: "claude-sonnet-4-6"
+    vaults: ["`+name+`"]
+`)
+			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("Load with vault name %q expected error", name)
+			}
+			if !strings.Contains(err.Error(), "vault name") {
+				t.Errorf("Load(%q) error = %v, want vault name validation message", name, err)
+			}
+		})
+	}
+}
+
+func TestLoad_AgentVaultNamesValid(t *testing.T) {
+	path := writeYAML(t, `
+project: myteam
+coordination:
+  backend: discord
+  server_id: "1"
+  channels: {general: "g"}
+operator:
+  discord_ids: ["277434478803156993"]
+agents:
+  lead:
+    name: "Lead"
+    model: "claude-sonnet-4-6"
+    vaults: ["shared", "github-tokens"]
+`)
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load with valid vault names: %v", err)
+	}
+}
+
 func TestLoad_PrimaryMilestoneParsed(t *testing.T) {
 	path := writeYAML(t, `
 project: myteam

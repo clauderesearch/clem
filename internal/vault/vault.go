@@ -23,6 +23,19 @@ func validateSecretKey(key string) error {
 	return nil
 }
 
+// validVaultName mirrors the allowlist used for project and agent keys.
+// Vault names land in yq path expressions in Get and DecryptForAgent; a name
+// with yq operator characters (// | . []) alters expression semantics and can
+// leak secrets from vaults the agent was never granted.
+var validVaultName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
+
+func validateVaultName(name string) error {
+	if !validVaultName.MatchString(name) {
+		return fmt.Errorf("vault name %q must match ^[a-z][a-z0-9-]{0,30}$ (same allowlist as project and agent keys)", name)
+	}
+	return nil
+}
+
 // Init generates an age keypair and saves it to ~/.config/sops/age/keys.txt.
 // Prints the public key and instructions for .sops.yaml.
 func Init() error {
@@ -87,6 +100,9 @@ func Init() error {
 // Set sets a secret key for a vault in secrets.sops.yaml using sops --set.
 // keyval should be "KEY=value".
 func Set(vaultName, keyval string) error {
+	if err := validateVaultName(vaultName); err != nil {
+		return err
+	}
 	parts := strings.SplitN(keyval, "=", 2)
 	if len(parts) != 2 {
 		return fmt.Errorf("invalid format, expected KEY=value, got: %s", keyval)
@@ -131,6 +147,9 @@ func Set(vaultName, keyval string) error {
 
 // Delete removes a secret key (or whole vault if key is empty) from secrets.sops.yaml.
 func Delete(vaultName, key string) error {
+	if err := validateVaultName(vaultName); err != nil {
+		return err
+	}
 	if key != "" {
 		if err := validateSecretKey(key); err != nil {
 			return err
@@ -142,12 +161,9 @@ func Delete(vaultName, key string) error {
 
 	var unsetExpr string
 	if key == "" {
-		unsetExpr = fmt.Sprintf(`["vaults"]["%s"]`, strings.ReplaceAll(vaultName, `"`, `\"`))
+		unsetExpr = fmt.Sprintf(`["vaults"]["%s"]`, jqEscape(vaultName))
 	} else {
-		unsetExpr = fmt.Sprintf(`["vaults"]["%s"]["%s"]`,
-			strings.ReplaceAll(vaultName, `"`, `\"`),
-			strings.ReplaceAll(key, `"`, `\"`),
-		)
+		unsetExpr = fmt.Sprintf(`["vaults"]["%s"]["%s"]`, jqEscape(vaultName), jqEscape(key))
 	}
 
 	// sops unset takes "file index" — file before index
@@ -165,6 +181,9 @@ func Delete(vaultName, key string) error {
 
 // Get retrieves a secret key for a vault from secrets.sops.yaml.
 func Get(vaultName, key string) error {
+	if err := validateVaultName(vaultName); err != nil {
+		return err
+	}
 	if err := validateSecretKey(key); err != nil {
 		return err
 	}
@@ -177,7 +196,7 @@ func Get(vaultName, key string) error {
 		return err
 	}
 
-	yqExpr := fmt.Sprintf(".vaults.%s.%s", vaultName, key)
+	yqExpr := fmt.Sprintf(`.vaults["%s"]["%s"]`, jqEscape(vaultName), jqEscape(key))
 	out, err := runYQ(yqExpr, decrypted)
 	if err != nil {
 		return fmt.Errorf("yq: %w", err)
@@ -240,6 +259,11 @@ func List() error {
 // Later vaults in the list win on key conflicts.
 // Falls back to legacy agents: structure with a warning if vaults: key is absent.
 func DecryptForAgent(agentKey string, vaultNames []string) (map[string]string, error) {
+	for _, vaultName := range vaultNames {
+		if err := validateVaultName(vaultName); err != nil {
+			return nil, err
+		}
+	}
 	if err := ensureSops(); err != nil {
 		return nil, err
 	}
@@ -270,7 +294,7 @@ func DecryptForAgent(agentKey string, vaultNames []string) (map[string]string, e
 
 	result := make(map[string]string)
 	for _, vaultName := range vaultNames {
-		yqExpr := fmt.Sprintf(".vaults.%s | to_entries | .[] | .key + \"=\" + .value", vaultName)
+		yqExpr := fmt.Sprintf(`.vaults["%s"] | to_entries | .[] | .key + "=" + .value`, jqEscape(vaultName))
 		out, err := runYQ(yqExpr, decrypted)
 		if err != nil {
 			return nil, fmt.Errorf("yq for vault %s: %w", vaultName, err)
