@@ -515,8 +515,7 @@ func Generate(cfg *config.Config, agentKey string) string {
 
 	subagentExport := ""
 	if ac.SubagentModel != "" {
-		subagentExport = fmt.Sprintf("export CLAUDE_CODE_SUBAGENT_MODEL='%s'",
-				strings.ReplaceAll(ac.SubagentModel, "'", `'\''`))
+		subagentExport = fmt.Sprintf("export CLAUDE_CODE_SUBAGENT_MODEL=%q", ac.SubagentModel)
 	}
 	skillsSyncCmd := ""
 	if cfg.SkillsRepo != "" {

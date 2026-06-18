@@ -74,7 +74,7 @@ func TestGenerate_SubagentModelExportPresent(t *testing.T) {
 
 	out := Generate(cfg, "lead")
 
-	want := `export CLAUDE_CODE_SUBAGENT_MODEL='claude-sonnet-4-6'`
+	want := `export CLAUDE_CODE_SUBAGENT_MODEL="claude-sonnet-4-6"`
 	if !strings.Contains(out, want) {
 		t.Fatalf("expected runner to contain %q, got:\n%s", want, out)
 	}
@@ -107,7 +107,7 @@ func TestGenerate_SubagentModelOnOpencodeRuntime(t *testing.T) {
 
 	out := Generate(cfg, "lead")
 
-	want := `export CLAUDE_CODE_SUBAGENT_MODEL='claude-sonnet-4-6'`
+	want := `export CLAUDE_CODE_SUBAGENT_MODEL="claude-sonnet-4-6"`
 	if !strings.Contains(out, want) {
 		t.Fatalf("expected opencode runner to contain %q, got:\n%s", want, out)
 	}
