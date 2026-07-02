@@ -134,7 +134,7 @@ check_oom() {
     local hits
     hits=$(journalctl --since "$since" --no-pager 2>/dev/null \
         | grep -E "killed by the OOM killer" \
-        | grep -oE "clem-[a-zA-Z0-9_-]+\.service" \
+        | grep -oE "clem-${PROJECT}-[a-zA-Z0-9_-]+\.service" \
         | sort | uniq -c | awk '{printf "%s x%s\n", $2, $1}')
     if [ -n "$hits" ]; then
         local mem

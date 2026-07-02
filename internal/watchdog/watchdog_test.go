@@ -1,6 +1,7 @@
 package watchdog
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
@@ -151,7 +152,7 @@ func TestGenerateScript_OOMCheckPresent(t *testing.T) {
 		`check_oom()`,
 		`journalctl --since "$since" --no-pager`,
 		`killed by the OOM killer`,
-		`clem-[a-zA-Z0-9_-]+\.service`,
+		`clem-${PROJECT}-[a-zA-Z0-9_-]+\.service`,
 		`OOM-kill detected`,
 		`free -h`,
 	} {
@@ -166,6 +167,20 @@ func TestGenerateScript_OOMCheckPresent(t *testing.T) {
 	callIdx := strings.LastIndex(s, "check_oom")
 	if defIdx == -1 || callIdx == -1 || callIdx <= defIdx {
 		t.Errorf("check_oom must be defined and then invoked (def=%d call=%d)", defIdx, callIdx)
+	}
+}
+
+// TestGenerateScript_OOMCheckScopedToProject regression-tests #148: the OOM
+// grep must match only this project's services, not every clem-* service
+// on the host (which double-reports OOM kills across co-located projects).
+func TestGenerateScript_OOMCheckScopedToProject(t *testing.T) {
+	s := GenerateScript(baseCfg())
+	re := regexp.MustCompile(`grep -oE "clem-\$\{PROJECT\}-\[a-zA-Z0-9_-\]\+\\.service"`)
+	if !re.MatchString(s) {
+		t.Errorf("expected project-scoped OOM service grep, got:\n%s", s)
+	}
+	if strings.Contains(s, `grep -oE "clem-[a-zA-Z0-9_-]+\.service"`) {
+		t.Errorf("OOM grep must not match all clem-* services host-wide:\n%s", s)
 	}
 
 	// marker must be written after the journalctl scan to avoid silently
