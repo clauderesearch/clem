@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"sort"
-	"strings"
 
 	"github.com/jahwag/clem/internal/agent"
 	"github.com/jahwag/clem/internal/config"
@@ -28,10 +27,7 @@ func init() {
 
 func runLogin(cmd *cobra.Command, args []string) error {
 	if loginRemote != "" {
-		if len(args) > 0 {
-			return fmt.Errorf("agent args are not supported with --remote; run clem login %s on the remote host instead", strings.Join(args, " "))
-		}
-		return remote.Login(loginRemote)
+		return remote.Login(loginRemote, args)
 	}
 
 	agents, err := selectAgents(cfg.Agents, args)

@@ -78,6 +78,10 @@ func SSH(host, command string) error {
 // Tests may replace it to simulate failures.
 var remoteSSH = SSH
 
+// remoteSSHT is the TTY-SSH implementation used by Login.
+// Tests may replace it to simulate failures.
+var remoteSSHT func(host, command string) error = SSHT
+
 // SSHT runs a command on the remote host with a TTY allocated (required for interactive prompts).
 func SSHT(host, command string) error {
 	cmd := exec.Command("ssh", "-t", "-o", "StrictHostKeyChecking=accept-new", host, command)
@@ -151,15 +155,24 @@ func Provision(host, ghToken string) error {
 }
 
 // Login runs clem login on the remote host with a TTY for interactive OAuth.
-func Login(host string) error {
+// agents, if provided, are forwarded as positional args to the remote clem login invocation.
+func Login(host string, agents []string) error {
 	repoName, err := ValidatedRepoName()
 	if err != nil {
 		return err
 	}
+	for _, a := range agents {
+		if err := validateAgentKey(a); err != nil {
+			return err
+		}
+	}
 	fmt.Printf("Remote: %s\n\n", host)
 	loginCmd := fmt.Sprintf("cd ~/%s && clem login", repoName)
-	if err := SSHT(host, loginCmd); err != nil {
-		return fmt.Errorf("remote login: %w\nManual: ssh -t %s 'cd ~/%s && clem login'", err, host, repoName)
+	if len(agents) > 0 {
+		loginCmd += " " + strings.Join(agents, " ")
+	}
+	if err := remoteSSHT(host, loginCmd); err != nil {
+		return fmt.Errorf("remote login: %w\nManual: ssh -t %s '%s'", err, host, loginCmd)
 	}
 	return nil
 }

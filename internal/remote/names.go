@@ -14,6 +14,15 @@ func validateRepoName(name string) error {
 	return nil
 }
 
+var validAgentKey = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,100}$`)
+
+func validateAgentKey(key string) error {
+	if !validAgentKey.MatchString(key) {
+		return fmt.Errorf("agent key %q contains unsafe characters", key)
+	}
+	return nil
+}
+
 // ValidatedRepoName returns RepoName after rejecting shell-metacharacter payloads.
 func ValidatedRepoName() (string, error) {
 	name, err := RepoName()
