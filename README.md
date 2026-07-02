@@ -107,9 +107,9 @@ An autonomous agent is an untrusted workload: prompt injection, a poisoned depen
 | **remove** | drop the credential/MCP entirely | nowhere | unused attack surface |
 | **egress firewall** | per-agent nftables UID rule forces all traffic through a loopback proxy; everything else is rejected by the kernel | n/a | data exfiltration to unapproved hosts |
 
-**Why this is stronger than in-process or single-container sandboxes:** the boundary is a **per-OS-UID kernel firewall a non-root agent cannot disable**, plus a credential broker running as a **different user the agent cannot read** — neither depends on the agent's cooperation, and there is no in-process escape hatch. A compromised agent holds no usable secrets and can reach no unapproved network.
+**Why this is stronger than in-process or single-container sandboxes:** each agent takes one disposition — a **per-OS-UID kernel firewall a non-root agent cannot disable**, *or* a credential broker running as a **different user the agent cannot read**. Neither depends on the agent's cooperation, there is no in-process escape hatch, and a fleet freely mixes both dispositions across agents.
 
-Honest about the parts that are borrowed: the egress proxy and credential broker are battle-tested OSS primitives ([pipelock](https://github.com/luckyPipewrench/pipelock), [Infisical agent-vault](https://github.com/Infisical/agent-vault)). clem's contribution is the **OS-level composition** — per-agent UID identity + kernel firewall + secret supply, wired so the agent literally cannot route around either.
+Honest about the parts that are borrowed: the egress proxy and credential broker are battle-tested OSS primitives ([pipelock](https://github.com/luckyPipewrench/pipelock), [Infisical agent-vault](https://github.com/Infisical/agent-vault)). clem's contribution is the **OS-level composition** — per-agent UID identity wired to whichever boundary applies, so the agent cannot route around it.
 
 → Full threat model, guarantees, and known limitations: **[docs/threat-model.md](docs/threat-model.md)**.
 → Worked reference config: **[samples/secure-fleet/](samples/secure-fleet/)**.

@@ -580,7 +580,7 @@ agents:
            <span class="eyebrow kicker">Autonomous, not unsupervised</span>
            <h2 class="display" style="font-size:clamp(30px,4vw,48px);margin:0 0 24px">They run on their own. You hold the keys.</h2>
            <p class="lead" style="max-width:520px;margin:0 0 22px">An autonomous agent is an untrusted workload. It needs secrets and network access to do real work, but you should not trust it to hold a raw credential or to decide for itself what it can reach.</p>
-           <p style="font-size:16px;color:var(--ink-soft);max-width:520px;margin:0">clem puts the boundary below the agent. Each one runs as its own non-root user. Secrets and egress are enforced by the kernel and a separate user the agent cannot read or override. Compromise the agent and the boundary still holds.</p>
+           <p style="font-size:16px;color:var(--ink-soft);max-width:520px;margin:0">clem puts the boundary below the agent. Each one runs as its own non-root user. You pick a disposition per agent: egress pinned by a kernel rule it cannot disable, or credentials held by a separate user it cannot read. Either way, compromise the agent and its boundary still holds.</p>
            <blockquote class="quote-side">&ldquo;It did all the work it was allowed to. The last call is still yours.&rdquo;</blockquote>
          </div>
          <div class="checks">
