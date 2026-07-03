@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -871,8 +872,12 @@ func TestWriteEnvFile_WritesSecretsAndGitignore(t *testing.T) {
 	dir := t.TempDir()
 	secrets := map[string]string{"GH_TOKEN": "gh-test-token", "FOO": "bar"}
 
-	if err := WriteEnvFile("testuser", dir, secrets); err != nil {
+	changed, err := WriteEnvFile("testuser", dir, secrets)
+	if err != nil {
 		t.Fatalf("WriteEnvFile: %v", err)
+	}
+	if !changed {
+		t.Error("first write should report changed")
 	}
 
 	envData, err := os.ReadFile(filepath.Join(dir, ".env"))
@@ -903,7 +908,7 @@ func TestWriteEnvFile_SingleQuotesSpecialChars(t *testing.T) {
 		"QUOTE":    "it's here",
 	}
 
-	if err := WriteEnvFile("testuser", dir, secrets); err != nil {
+	if _, err := WriteEnvFile("testuser", dir, secrets); err != nil {
 		t.Fatalf("WriteEnvFile: %v", err)
 	}
 
@@ -1645,8 +1650,12 @@ func TestSyncSkillsRepo_RoutesGitThroughBrokerEnv(t *testing.T) {
 		name string
 		sync func(home string) error
 	}{
-		{"provision", func(home string) error { return SyncSkillsRepo("testuser", home, "worker", "https://example.com/owner/team-skills.git") }},
-		{"self", func(home string) error { return SyncSkillsRepoAsSelf(home, "worker", "https://example.com/owner/team-skills.git") }},
+		{"provision", func(home string) error {
+			return SyncSkillsRepo("testuser", home, "worker", "https://example.com/owner/team-skills.git")
+		}},
+		{"self", func(home string) error {
+			return SyncSkillsRepoAsSelf(home, "worker", "https://example.com/owner/team-skills.git")
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stub := withSkillsStub(t)
@@ -1992,5 +2001,96 @@ func TestAuthMode(t *testing.T) {
 func TestAuthMode_NoEnvFile(t *testing.T) {
 	if got := AuthMode(t.TempDir()); got != "" {
 		t.Errorf("AuthMode with no .env = %q, want empty", got)
+	}
+}
+
+func TestTryRestartService_UsesTryRestart(t *testing.T) {
+	stub := withStub(t)
+	if err := TryRestartService("clem-cdev-lead.service"); err != nil {
+		t.Fatalf("TryRestartService: %v", err)
+	}
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected one Run call, got %v", stub.calls)
+	}
+	want := []string{"systemctl", "try-restart", "clem-cdev-lead.service"}
+	if !reflect.DeepEqual(stub.calls[0], want) {
+		t.Errorf("call = %v, want %v", stub.calls[0], want)
+	}
+}
+
+func TestTryRestartService_Error(t *testing.T) {
+	stub := withStub(t)
+	stub.failOn = "systemctl"
+	if err := TryRestartService("clem-x.service"); err == nil {
+		t.Error("expected error when systemctl fails")
+	}
+}
+
+func TestWriteEnvFile_StableAndChangeDetected(t *testing.T) {
+	withStub(t)
+	dir := t.TempDir()
+	secrets := map[string]string{"B_KEY": "2", "A_KEY": "1"}
+
+	if changed, err := WriteEnvFile("testuser", dir, secrets); err != nil || !changed {
+		t.Fatalf("first write: changed=%v err=%v, want true nil", changed, err)
+	}
+	// Same content rewritten must be byte-identical (sorted keys) → unchanged,
+	// so provision does not restart running agents on a no-op re-provision.
+	if changed, err := WriteEnvFile("testuser", dir, secrets); err != nil || changed {
+		t.Fatalf("identical rewrite: changed=%v err=%v, want false nil", changed, err)
+	}
+	envData, _ := os.ReadFile(filepath.Join(dir, ".env"))
+	if !strings.HasPrefix(string(envData), "export A_KEY='1'\nexport B_KEY='2'\n") {
+		t.Errorf(".env not sorted: %s", envData)
+	}
+
+	secrets["C_KEY"] = "3"
+	if changed, err := WriteEnvFile("testuser", dir, secrets); err != nil || !changed {
+		t.Fatalf("modified write: changed=%v err=%v, want true nil", changed, err)
+	}
+}
+
+func TestReadEnvValue_RoundTrip(t *testing.T) {
+	withStub(t)
+	dir := t.TempDir()
+	secrets := map[string]string{
+		"AGENT_VAULT_TOKEN": "av_agt_abc123",
+		"QUOTED":            "it's here",
+	}
+	if _, err := WriteEnvFile("testuser", dir, secrets); err != nil {
+		t.Fatalf("WriteEnvFile: %v", err)
+	}
+	if got := ReadEnvValue(dir, "AGENT_VAULT_TOKEN"); got != "av_agt_abc123" {
+		t.Errorf("AGENT_VAULT_TOKEN = %q", got)
+	}
+	if got := ReadEnvValue(dir, "QUOTED"); got != "it's here" {
+		t.Errorf("QUOTED = %q, escaping not round-tripped", got)
+	}
+	if got := ReadEnvValue(dir, "MISSING"); got != "" {
+		t.Errorf("MISSING = %q, want empty", got)
+	}
+	if got := ReadEnvValue(filepath.Join(dir, "nope"), "AGENT_VAULT_TOKEN"); got != "" {
+		t.Errorf("no .env = %q, want empty", got)
+	}
+}
+
+func TestProxyTokenValid_ProbesThroughProxy(t *testing.T) {
+	stub := withStub(t)
+	av := config.VaultBackend{}
+	if !ProxyTokenValid(av, "av_agt_tok", "cdev_lead") {
+		t.Fatal("valid probe should return true")
+	}
+	if len(stub.calls) != 1 || stub.calls[0][0] != "curl" {
+		t.Fatalf("expected one curl call, got %v", stub.calls)
+	}
+	joined := strings.Join(stub.calls[0], " ")
+	// Vault name must be agent-vault-normalized ('_' rejected there).
+	if !strings.Contains(joined, "av_agt_tok") || strings.Contains(joined, "cdev_lead") {
+		t.Errorf("proxy URL not built from token + normalized vault: %s", joined)
+	}
+
+	stub.failOn = "curl"
+	if ProxyTokenValid(av, "av_agt_tok", "cdev_lead") {
+		t.Error("failed probe (407/unreachable) must report invalid so caller rotates")
 	}
 }
