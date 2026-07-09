@@ -44,7 +44,6 @@ tail -500 "$LOGFILE" > "$LOGFILE.tmp" 2>/dev/null && mv "$LOGFILE.tmp" "$LOGFILE
 export ENABLE_CLAUDEAI_MCP_SERVERS=false
 # Skip IDE extension auto-install probe — agents run in headless tmux, no IDE.
 export CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL=1
-{{.ProxyExport}}
 # Load secrets (written by clem provision, never committed)
 [ -f "$HOME/.env" ] && source "$HOME/.env"
 {{.SubagentExport}}
@@ -140,7 +139,7 @@ while true; do
         fi
     fi
 
-    # claude install (bun fetch) can't traverse the pipelock proxy — it fails
+    # claude install (bun fetch) can't traverse the egress proxy — it fails
     # "Socket is closed" every iteration on egress-contained hosts. Skip it
     # there; updates for contained agents happen at (re)provision time.
     if [ -n "$HTTPS_PROXY" ]; then
@@ -272,7 +271,6 @@ cd "$WORKDIR" || exit 1
 log() { echo "$(date -Iseconds) $1" | tee -a "$LOGFILE"; }
 
 tail -500 "$LOGFILE" > "$LOGFILE.tmp" 2>/dev/null && mv "$LOGFILE.tmp" "$LOGFILE" 2>/dev/null
-{{.ProxyExport}}
 [ -f "$HOME/.env" ] && source "$HOME/.env"
 {{.SubagentExport}}
 # Write opencode.json with Ollama provider + discord-bot MCP (if token is set).
@@ -403,7 +401,6 @@ cd "$WORKDIR" || exit 1
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGFILE"; }
 tail -500 "$LOGFILE" > "$LOGFILE.tmp" 2>/dev/null && mv "$LOGFILE.tmp" "$LOGFILE" 2>/dev/null
 
-{{.ProxyExport}}
 # Load secrets (written by clem provision, never committed) before the config
 # writer reads them from the environment.
 [ -f "$HOME/.env" ] && source "$HOME/.env"
@@ -557,13 +554,13 @@ WantedBy=multi-user.target
 // egressDirectives is the systemd IP-firewall block injected when egress
 // containment is enabled for an agent. It is intentionally loopback-only:
 // hard enforcement (and the domain allowlist) lives in the clem-nftables UID
-// firewall + pipelock proxy. This systemd block is a cheap second kernel layer
-// that blocks all direct internet egress even if the nftables ruleset is
-// flushed. There are no hardcoded CIDRs to drift — the agent reaches the
-// internet only via the loopback pipelock proxy.
+// firewall + agent-vault's TLS-MITM proxy. This systemd block is a cheap second
+// kernel layer that blocks all direct internet egress even if the nftables
+// ruleset is flushed. There are no hardcoded CIDRs to drift — the agent reaches
+// the internet only via the loopback agent-vault proxy.
 const egressDirectives = `# Egress containment (egress: enabled). Hard enforcement + domain allowlist
-# live in the clem-nftables UID firewall and the pipelock proxy. This block is
-# a second kernel layer blocking direct internet egress.
+# live in the clem-nftables UID firewall and agent-vault's TLS-MITM proxy. This
+# block is a second kernel layer blocking direct internet egress.
 IPAddressDeny=any
 IPAddressAllow=127.0.0.0/8
 IPAddressAllow=::1/128
@@ -611,11 +608,8 @@ type RunnerParams struct {
 	EgressDirectives    string
 	HardeningDirectives string
 	ResourceDirectives  string
-	// ProxyExport is the HTTPS_PROXY/NO_PROXY export block injected into the
-	// runner when egress containment is enabled for the agent. Empty otherwise.
-	ProxyExport string
 	// ProxyUnitDeps is the After=/Wants= block tying the agent service to the
-	// pipelock + nftables units when egress containment is enabled.
+	// agent-vault + nftables units when egress containment is enabled.
 	ProxyUnitDeps string
 	// WatchChannelIDs is the comma-separated list of Discord channel IDs the
 	// MCP server's gateway watcher should observe. Empty disables the watcher
@@ -658,6 +652,10 @@ func headroomLaunchSnippet(enabled bool) string {
 	return `    if [ -x "$HOME/.local/bin/headroom" ]; then
         export PATH="$HOME/.local/bin:$PATH"
         HEADROOM_PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+        # wrap's 'claude mcp add' is a no-op when the server already exists,
+        # leaving HEADROOM_PROXY_URL pinned to a dead port from a prior
+        # iteration; remove it so wrap re-adds with this iteration's port.
+        "$CLAUDE" mcp remove headroom >/dev/null 2>&1 || true
         LAUNCH="$HOME/.local/bin/headroom wrap claude -p $HEADROOM_PORT --no-context-tool --no-serena"
     else
         log "headroom enabled but not installed; launching claude directly"
@@ -747,7 +745,7 @@ func Generate(cfg *config.Config, agentKey string) string {
 		Prompt:         strings.ReplaceAll(promptText, "'", `'\''`),
 		OSUser:         cfg.OSUsername(agentKey),
 		HomeDir:        fmt.Sprintf("/home/%s", cfg.OSUsername(agentKey)),
-		SleepActive: iterSec,
+		SleepActive:    iterSec,
 		// Night sleep defaults to the active value; iteration_night overrides.
 		// History: a hardcoded 2x night doubler was removed on the belief the
 		// prompt-cache TTL was 5 min. Subscription Claude Code actually gets
@@ -759,7 +757,6 @@ func Generate(cfg *config.Config, agentKey string) string {
 		WatchChannelIDs:     watchChannelIDs(cfg),
 		CoordinationBackend: cfg.Coordination.BackendOrDefault(),
 		GitHubWatchUnitDeps: githubWatchUnitDeps(cfg, agentKey),
-		ProxyExport:         proxyExportBlock(cfg, agentKey),
 		SidecarServers:      sidecarServersLiteral(cfg, agentKey),
 		SkillsSyncCmd:       skillsSyncCmd,
 		InstructionFile:     ac.InstructionFileName(),
@@ -822,32 +819,15 @@ func buildHardeningDirectives(homeDir, _ string) string {
 	)
 }
 
-// proxyExportBlock returns the HTTPS_PROXY/NO_PROXY export injected into the
-// runner when egress containment is enabled for the agent. Exported before
-// sourcing $HOME/.env so an operator can still override per-host. Empty when
-// containment is disabled. NO_PROXY keeps loopback (Ollama, MCP sockets) direct.
-func proxyExportBlock(cfg *config.Config, agentKey string) string {
-	if !cfg.EgressEnabledFor(agentKey) {
-		return ""
-	}
-	port := cfg.Egress.ProxyPortOrDefault()
-	return fmt.Sprintf(`# Egress containment: route HTTP(S) through the pipelock proxy. The nftables
-# UID firewall blocks all other egress, so this loopback proxy is the only way
-# out. NO_PROXY keeps loopback (Ollama, MCP sockets) direct.
-export HTTPS_PROXY=http://127.0.0.1:%d
-export HTTP_PROXY=http://127.0.0.1:%d
-export NO_PROXY=127.0.0.1,localhost,::1`, port, port)
-}
-
 // proxyUnitDeps returns the [Unit] dependency block tying the agent service to
 // the egress stack. The nftables firewall is a hard Requires= (fail-CLOSED: if
-// the firewall fails to load, the agent must not start unconfined). The
-// pipelock proxy is a soft Wants= — losing it costs connectivity, not
-// containment. After= orders the agent behind both so the boundary is up first.
+// the firewall fails to load, the agent must not start unconfined). agent-vault
+// is a soft Wants= — losing it costs connectivity, not containment. After=
+// orders the agent behind both so the boundary is up first.
 func proxyUnitDeps(cfg *config.Config) string {
 	return fmt.Sprintf("Requires=%s\nWants=%s\nAfter=%s %s\n",
-		cfg.NftablesServiceName(), cfg.PipelockServiceName(),
-		cfg.PipelockServiceName(), cfg.NftablesServiceName())
+		cfg.NftablesServiceName(), cfg.AgentVaultServiceName(),
+		cfg.AgentVaultServiceName(), cfg.NftablesServiceName())
 }
 
 // GenerateService renders the systemd service unit content for an agent.
@@ -921,7 +901,6 @@ func renderTemplate(tmpl string, p RunnerParams) string {
 		"{{.HardeningDirectives}}", p.HardeningDirectives,
 		"{{.ResourceDirectives}}", p.ResourceDirectives,
 		"{{.WatchChannelIDs}}", p.WatchChannelIDs,
-		"{{.ProxyExport}}", p.ProxyExport,
 		"{{.ProxyUnitDeps}}", p.ProxyUnitDeps,
 		"{{.SidecarServers}}", p.SidecarServers,
 		"{{.CoordinationBackend}}", p.CoordinationBackend,

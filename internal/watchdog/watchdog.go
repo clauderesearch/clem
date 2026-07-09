@@ -7,7 +7,6 @@ import (
 
 	"github.com/jahwag/clem/internal/config"
 	"github.com/jahwag/clem/internal/coordination"
-	"github.com/jahwag/clem/internal/proxy"
 )
 
 const watchdogScript = `#!/bin/bash
@@ -171,52 +170,13 @@ prune_transcripts() {
     done
     touch "$stamp"
 }
-{{.EgressCheckDef}}{{.VaultCheckDef}}
+{{.VaultCheckDef}}
+{{.DenyCheckDef}}
 {{.AgentChecks}}
 
 check_oom
 prune_transcripts
-{{.EgressInvoke}}{{.VaultInvoke}}`
-
-// egressCheckDef is injected when egress containment is enabled. It tails the
-// signed pipelock audit JSONL by line position (robust to rotation, needs no
-// jq) and routes blocked/DLP egress events through the existing send_alert.
-// The watchdog runs as root, so its alert curl bypasses the agent egress
-// firewall — an exfil block cannot also suppress its own alert. Only counts
-// and destination hosts are emitted (pipelock already redacts secrets).
-//
-// NOTE: the verdict/host field names below are matched tolerantly across
-// pipelock's likely schema; confirm against a live audit line and tighten.
-const egressCheckDef = `
-check_egress() {
-    local audit="{{.AuditLogPath}}"
-    [ -f "$audit" ] || return
-    local marker="$COOLDOWN_DIR/egress.pos"
-    local last_pos=0
-    [ -f "$marker" ] && last_pos=$(cat "$marker")
-    local total
-    total=$(wc -l < "$audit" 2>/dev/null || echo 0)
-    # Log rotated/truncated since last run — restart from the top.
-    if (( last_pos > total )); then last_pos=0; fi
-    if (( total > last_pos )); then
-        local new
-        new=$(tail -n +$((last_pos + 1)) "$audit" 2>/dev/null)
-        local blocked
-        blocked=$(printf '%s\n' "$new" | grep -Ec '"(action|decision|verdict)":[[:space:]]*"(block|blocked|deny|denied)"|"dlp"|"blocked":[[:space:]]*true' || true)
-        if (( blocked > 0 )); then
-            local dests
-            # Only emit bare hostnames (host/sni) — never url/destination, which
-            # can carry a query string with a secret (e.g. ?token=...) and would
-            # otherwise be exfiltrated verbatim into the chat backend by send_alert.
-            dests=$(printf '%s\n' "$new" \
-                | grep -oE '"(host|sni)":[[:space:]]*"[^"]+"' \
-                | sed -E 's/.*:[[:space:]]*"//; s/"$//' | sort -u | head -5 | tr '\n' ' ')
-            send_alert "🛑 clem/$PROJECT egress: $blocked blocked/DLP event(s) — $dests"
-        fi
-    fi
-    echo "$total" > "$marker"
-}
-`
+{{.VaultInvoke}}{{.DenyCheckInvoke}}`
 
 // vaultCheckDef is injected when the agent-vault credential proxy is active. It
 // is a single point of failure for ALL brokered agents' auth, so the watchdog
@@ -238,6 +198,38 @@ check_agent_vault() {
     if [ "$healthy" != yes ]; then
         send_alert "🔴 clem/$PROJECT agent-vault DOWN (state=$(systemctl is-active "$svc") health=$healthy) — brokered agents are failing auth"
     fi
+}
+`
+
+// denyEventCheckDef is injected when agent-vault is active and at least one
+// agent has egress containment enabled. Containment's deny policy is only as
+// good as an operator's ability to notice it firing on a host that should be
+// allowlisted (or an agent probing somewhere it shouldn't) — so this counts
+// new unmatched-host denials (agent-vault's proxy_request log line, err=no_match)
+// since the last check and alerts per denied host. Requires AGENT_VAULT_LOG_LEVEL=debug
+// on the agent-vault unit (set by clem provision when egress is enabled) since
+// proxy_request logs at slog Debug level.
+const denyEventCheckDef = `
+check_deny_events() {
+    local marker="$COOLDOWN_DIR/deny-events.last"
+    local since
+    if [ -f "$marker" ]; then
+        since="@$(cat "$marker")"
+    else
+        since="5 minutes ago"
+    fi
+
+    local hits
+    hits=$(journalctl -u "{{.VaultService}}" --since "$since" --no-pager 2>/dev/null \
+        | grep "msg=proxy_request" \
+        | grep "err=no_match" \
+        | grep -oE '\bhost=[^ ]*' \
+        | sed 's/^host=//' \
+        | sort | uniq -c | sort -rn | awk '{printf "%s x%s\n", $2, $1}')
+    if [ -n "$hits" ]; then
+        send_alert "🚫 clem/$PROJECT agent-vault denied unmatched-host requests: $hits"
+    fi
+    date +%s > "$marker"
 }
 `
 
@@ -277,18 +269,27 @@ const staleMarginSeconds = 300
 const staleFloorSeconds = 1800
 
 type watchdogParams struct {
-	Project        string
-	AgentHomes     string
-	EnvSource      string
-	AlertChannel   string
-	TokenEnvVar    string
-	AlertCurl      string
-	AgentChecks    string
-	EgressCheckDef string
-	EgressInvoke   string
-	AuditLogPath   string
-	VaultCheckDef  string
-	VaultInvoke    string
+	Project         string
+	AgentHomes      string
+	EnvSource       string
+	AlertChannel    string
+	TokenEnvVar     string
+	AlertCurl       string
+	AgentChecks     string
+	VaultCheckDef   string
+	VaultInvoke     string
+	DenyCheckDef    string
+	DenyCheckInvoke string
+}
+
+// anyEgressEnabled reports whether at least one agent has egress containment on.
+func anyEgressEnabled(cfg *config.Config) bool {
+	for key := range cfg.Agents {
+		if cfg.EgressEnabledFor(key) {
+			return true
+		}
+	}
+	return false
 }
 
 // GenerateScript renders the watchdog shell script for the project.
@@ -348,23 +349,6 @@ func GenerateScript(cfg *config.Config) string {
 		checks.WriteString(fmt.Sprintf(`check_agent "%s" "%s" "%s" "%d"`+"\n", key, osUser, svc, stale))
 	}
 
-	// Egress monitoring is wired in only when at least one agent is contained.
-	egressDef, egressInvoke, auditPath := "", "", ""
-	anyEgress := false
-	for _, key := range keys {
-		if cfg.EgressEnabledFor(key) {
-			anyEgress = true
-			break
-		}
-	}
-	if anyEgress {
-		auditPath = proxy.AuditLogFile(cfg.Project)
-		// The main replacer is single-pass and will not re-scan injected text,
-		// so substitute the audit path into the egress block up front.
-		egressDef = strings.ReplaceAll(egressCheckDef, "{{.AuditLogPath}}", auditPath)
-		egressInvoke = "check_egress\n"
-	}
-
 	// agent-vault health monitoring, wired in only when the backend is active.
 	vaultDef, vaultInvoke := "", ""
 	if cfg.Vault.IsAgentVault() {
@@ -375,19 +359,30 @@ func GenerateScript(cfg *config.Config) string {
 		vaultInvoke = "check_agent_vault\n"
 	}
 
+	// Deny-event alerting rides on the same agent-vault unit but only makes
+	// sense (and only has debug-level logs to read) when some agent actually
+	// has egress containment enabled — see provisionAgentVaultHost's matching
+	// AGENT_VAULT_LOG_LEVEL=debug gate.
+	denyCheckDef, denyCheckInvoke := "", ""
+	if cfg.Vault.IsAgentVault() && anyEgressEnabled(cfg) {
+		denyCheckDef = strings.NewReplacer(
+			"{{.VaultService}}", cfg.AgentVaultServiceName(),
+		).Replace(denyEventCheckDef)
+		denyCheckInvoke = "check_deny_events\n"
+	}
+
 	p := watchdogParams{
-		Project:        cfg.Project,
-		EnvSource:      envSource,
-		AlertChannel:   alertChannel,
-		TokenEnvVar:    backend.TokenEnvVar,
-		AlertCurl:      alertCurl,
-		AgentChecks:    strings.TrimRight(checks.String(), "\n"),
-		AgentHomes:     agentHomes(cfg, keys),
-		EgressCheckDef: egressDef,
-		EgressInvoke:   egressInvoke,
-		AuditLogPath:   auditPath,
-		VaultCheckDef:  vaultDef,
-		VaultInvoke:    vaultInvoke,
+		Project:         cfg.Project,
+		EnvSource:       envSource,
+		AlertChannel:    alertChannel,
+		TokenEnvVar:     backend.TokenEnvVar,
+		AlertCurl:       alertCurl,
+		AgentChecks:     strings.TrimRight(checks.String(), "\n"),
+		AgentHomes:      agentHomes(cfg, keys),
+		VaultCheckDef:   vaultDef,
+		VaultInvoke:     vaultInvoke,
+		DenyCheckDef:    denyCheckDef,
+		DenyCheckInvoke: denyCheckInvoke,
 	}
 
 	r := strings.NewReplacer(
@@ -398,11 +393,10 @@ func GenerateScript(cfg *config.Config) string {
 		"{{.AlertCurl}}", p.AlertCurl,
 		"{{.AgentChecks}}", p.AgentChecks,
 		"{{.AgentHomes}}", p.AgentHomes,
-		"{{.EgressCheckDef}}", p.EgressCheckDef,
-		"{{.EgressInvoke}}", p.EgressInvoke,
-		"{{.AuditLogPath}}", p.AuditLogPath,
 		"{{.VaultCheckDef}}", p.VaultCheckDef,
 		"{{.VaultInvoke}}", p.VaultInvoke,
+		"{{.DenyCheckDef}}", p.DenyCheckDef,
+		"{{.DenyCheckInvoke}}", p.DenyCheckInvoke,
 	)
 	return r.Replace(watchdogScript)
 }

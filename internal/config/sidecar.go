@@ -286,15 +286,13 @@ func (cfg *Config) validateMCPSidecars() error {
 		}
 	}
 	if egressInUse {
-		reserved[cfg.Egress.ProxyPortOrDefault()] = "egress proxy_port"
 		for _, p := range cfg.Egress.AllowLocalhostPorts {
 			reserved[p] = "egress allow_localhost_ports"
 		}
 	}
 	if cfg.Vault.IsAgentVault() {
-		// Default mgmt/MITM ports; a custom vault address near base_port is not parsed here.
-		reserved[14321] = "agent-vault management port"
-		reserved[14322] = "agent-vault MITM port"
+		reserved[cfg.Vault.ManagementPortOrDefault()] = "agent-vault management port"
+		reserved[cfg.Vault.MITMPortOrDefault()] = "agent-vault MITM port"
 	}
 	for _, l := range listeners {
 		if owner, clash := reserved[l.Port]; clash {
