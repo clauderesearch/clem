@@ -738,30 +738,79 @@ func TestGenerate_CodexRunnerSelected(t *testing.T) {
 		Name:      "Lead",
 		Runtime:   "codex",
 		Model:     "gpt-5.4-codex",
+		Effort:    "high",
 		Iteration: "1m",
 		Prompt:    "do the thing. When done, run: kill $PPID",
 	})
 	out := Generate(cfg, "lead")
 
 	for _, want := range []string{
-		`CODEX="$HOME/.npm-global/bin/codex"`,        // codex binary path
-		"~/.codex/config.toml",                       // TOML config target
-		`cli_auth_credentials_store = \"file\"`,      // headless auth store
-		`forced_login_method = \"chatgpt\"`,          // clem login OAuth flow
-		"[mcp_servers.",                              // TOML MCP tables
-		"--dangerously-bypass-approvals-and-sandbox", // unattended execution
-		`timeout 7200 "$CODEX"`,                      // 2h interactive TUI cap
-		"tmux send-keys -l -t lead",                  // prompt injection contract
-		"--model gpt-5.4-codex",                      // model passthrough
+		`CODEX="$HOME/.npm-global/bin/codex"`,                    // codex binary path
+		"~/.codex/config.toml",                                   // TOML config target
+		`cli_auth_credentials_store = \"file\"`,                  // headless auth store
+		`forced_login_method = \"chatgpt\"`,                      // clem login OAuth flow
+		`model_reasoning_effort = \"high\"`,                      // harness-neutral effort passthrough
+		"[mcp_servers.",                                          // TOML MCP tables
+		"~/.clem/mcp-servers.json",                               // harness-neutral extension MCPs
+		"--dangerously-bypass-approvals-and-sandbox",             // unattended execution
+		`timeout 7200 "$CODEX"`,                                  // 2h interactive TUI cap
+		"npm install -g @openai/codex@latest --include=optional", // platform package must survive updates
+		"tmux send-keys -l -t lead",                              // prompt injection contract
+		"tmux send-keys -t lead Escape",                          // close $ skill picker before submit
+		"--model gpt-5.4-codex",                                  // model passthrough
+		`NEXT_EFFORT_FILE="$HOME/.clem/next-effort"`,             // shared one-session effort handoff
+		`CODEX_EFFORT_ARGS=(-c "model_reasoning_effort=\"$NEXT_EFFORT\"")`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("codex runner missing %q\nfull output:\n%s", want, out)
 		}
 	}
 
-	// Codex must NOT carry the Anthropic-only quota/effort machinery.
+	// Codex must NOT carry the Anthropic-only quota machinery.
 	if strings.Contains(out, "credentials.json") {
 		t.Errorf("codex runner should not reference claude credentials.json")
+	}
+}
+
+func TestGenerate_OpencodeRunnerMergesManagedMCPManifest(t *testing.T) {
+	cfg := baseCfg("lead", config.AgentConfig{
+		Name: "Lead", Runtime: "opencode", Iteration: "1m", Prompt: "do the thing",
+	})
+	out := Generate(cfg, "lead")
+	for _, want := range []string{"~/.clem/mcp-servers.json", "'type': 'local'", "'type': 'remote'"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("opencode runner missing managed MCP adapter %q", want)
+		}
+	}
+}
+
+func TestGenerate_CodexEffortMaxMapsToXHigh(t *testing.T) {
+	cfg := baseCfg("lead", config.AgentConfig{
+		Name: "Lead", Runtime: "codex", Effort: "max", Iteration: "1m", Prompt: "work",
+	})
+	out := Generate(cfg, "lead")
+	if !strings.Contains(out, `model_reasoning_effort = \"xhigh\"`) {
+		t.Fatalf("codex max effort should map to xhigh:\n%s", out)
+	}
+}
+
+func TestGenerate_CodexEmptyEffortLeavesDefault(t *testing.T) {
+	cfg := baseCfg("lead", config.AgentConfig{
+		Name: "Lead", Runtime: "codex", Iteration: "1m", Prompt: "work",
+	})
+	out := Generate(cfg, "lead")
+	if strings.Contains(out, "model_reasoning_effort =") {
+		t.Fatalf("empty effort should leave the Codex default unchanged:\n%s", out)
+	}
+}
+
+func TestGenerate_CodexSuccessfulShortRunUsesConfiguredInterval(t *testing.T) {
+	cfg := baseCfg("ops", config.AgentConfig{
+		Name: "Ops", Runtime: "codex", Iteration: "3h", Prompt: "check",
+	})
+	out := Generate(cfg, "ops")
+	if !strings.Contains(out, "if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 143 ]") {
+		t.Fatalf("successful Codex exits must use the configured iteration interval:\n%s", out)
 	}
 }
 
@@ -997,7 +1046,8 @@ func TestGenerate_NextEffortAndQuotaBlocks(t *testing.T) {
 	cfg := baseCfg("lead", config.AgentConfig{Name: "L", Iteration: "1m", Prompt: "p"})
 	out := Generate(cfg, "lead")
 	for _, want := range []string{
-		`if [ -f "$HOME/.claude/next-effort" ]`,
+		`NEXT_EFFORT_FILE="$HOME/.clem/next-effort"`,
+		`NEXT_EFFORT_FILE="$HOME/.claude/next-effort"`,
 		`export CLAUDE_CODE_EFFORT_LEVEL="$NEXT_EFFORT"`,
 		"unset CLAUDE_CODE_EFFORT_LEVEL",
 		`QUOTA_FILE="$HOME/.claude/quota.json"`,
