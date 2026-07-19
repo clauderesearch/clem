@@ -1,12 +1,16 @@
 package vault
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/jahwag/clem/internal/config"
 )
@@ -52,6 +56,20 @@ var avRunStdin = func(stdin string, args ...string) ([]byte, error) {
 var avHTTPGet = func(url string) (*http.Response, error) {
 	return http.Get(url) //nolint:gosec // addr is operator-controlled loopback
 }
+
+// avHTTPDo performs an arbitrary request against the agent-vault management API
+// (used for the owner-session login POST and the vault-settings PATCH, neither
+// of which the v0.22.0 CLI exposes). Replaced in tests.
+var avHTTPDo = func(req *http.Request) (*http.Response, error) {
+	return http.DefaultClient.Do(req)
+}
+
+// ownerBearer caches the owner API session token minted by LoginOwner for the
+// duration of a provision run. agent-vault has no admin-token concept, so
+// settings mutations (the unmatched-host deny policy) authenticate with an owner
+// Bearer obtained by logging in with the owner credentials from sops — the same
+// credentials EnsureOwner uses for the CLI owner session.
+var ownerBearer string
 
 // avEnv builds the connection env passed to every privileged CLI invocation.
 // Only AGENT_VAULT_ADDR is set — auth rides the owner session in $HOME.
@@ -111,6 +129,163 @@ func ApplyServices(addr, avVault string, services []config.Service) error {
 			return fmt.Errorf("agent-vault service add %s: %w\n%s", s.Name, err, out)
 		}
 		fmt.Printf("  applied service %s (%s → %s)\n", s.Name, s.Host, s.AuthType)
+	}
+	return nil
+}
+
+// passthroughServiceName derives a stable, valid agent-vault service name for an
+// allowlisted host (e.g. "*.anthropic.com" → "allow-wildcard-anthropic-com",
+// "anthropic.com" → "allow-anthropic-com"). The wildcard marker is encoded in
+// the prefix so an apex domain and its wildcard sibling — two distinct hosts —
+// never collide on the same service name. Charset sanitization reuses
+// config.AgentVaultName, the same slugger applied to vault names, rather than
+// a second private regexp.
+func passthroughServiceName(host string) string {
+	prefix := "allow-"
+	if strings.HasPrefix(host, "*.") {
+		prefix = "allow-wildcard-"
+		host = strings.TrimPrefix(host, "*.")
+	}
+	slug := strings.Trim(config.AgentVaultName(host), "-")
+	if slug == "" {
+		slug = "host"
+	}
+	return prefix + slug
+}
+
+// ApplyPassthroughServices allowlists each host in the given agent-vault vault as
+// a passthrough service (auth-type passthrough — the host is forwarded through
+// the MITM with no credential injection). Combined with the deny policy set by
+// SetUnmatchedHostPolicy, these are the egress allowlist for a contained agent.
+// `vault service add` is a true upsert (verified against agent-vault v0.22.0: it
+// never errors on a duplicate name), so this delegates straight to
+// ApplyServices — passthrough needs no auth flags beyond --auth-type, and
+// ApplyServices' switch already adds none for it. Requires an owner session
+// (call EnsureOwner first) and that avVault exists.
+func ApplyPassthroughServices(addr, avVault string, hosts []string) error {
+	services := make([]config.Service, 0, len(hosts))
+	for _, h := range hosts {
+		services = append(services, config.Service{
+			Name: passthroughServiceName(h), Host: h, AuthType: "passthrough",
+		})
+	}
+	return ApplyServices(addr, avVault, services)
+}
+
+// avServiceList is the subset of agent-vault's `vault service list` YAML
+// output (broker.Config{Vault, Services}) ReconcilePassthroughServices needs.
+type avServiceList struct {
+	Services []struct {
+		Name string `yaml:"name"`
+		Host string `yaml:"host"`
+	} `yaml:"services"`
+}
+
+// ReconcilePassthroughServices removes passthrough allowlist entries left over
+// from a previous provision whose host is no longer in domains — without this,
+// a domain dropped from clem.yaml's egress.domains stays reachable forever,
+// silently diverging the live allowlist from the checked-in config. Only
+// entries with the "allow-" service-name prefix (passthroughServiceName's
+// output) are ever candidates for removal; credential-injecting services from
+// ApplyServices are untouched. Uses the v0.22.0 `vault service list` +
+// `vault service remove --yes` CLI surface (verified present). Requires an
+// owner session (call EnsureOwner first) and that avVault exists.
+func ReconcilePassthroughServices(addr, avVault string, domains []string) error {
+	env := avEnv(addr)
+	name := config.AgentVaultName(avVault)
+	out, err := avRun(env, "vault", "service", "list", "--vault", name)
+	if err != nil {
+		return fmt.Errorf("agent-vault service list %s: %w\n%s", name, err, out)
+	}
+	var parsed avServiceList
+	if err := yaml.Unmarshal(out, &parsed); err != nil {
+		return fmt.Errorf("agent-vault service list %s: parsing output: %w", name, err)
+	}
+	want := make(map[string]bool, len(domains))
+	for _, h := range domains {
+		want[passthroughServiceName(h)] = true
+	}
+	for _, s := range parsed.Services {
+		if !strings.HasPrefix(s.Name, "allow-") || want[s.Name] {
+			continue
+		}
+		if out, err := avRun(env, "vault", "service", "remove", s.Name, "--vault", name, "--yes"); err != nil {
+			return fmt.Errorf("agent-vault service remove %s: %w\n%s", s.Name, err, out)
+		}
+		fmt.Printf("  removed stale passthrough service %s (%s no longer allowlisted)\n", s.Name, s.Host)
+	}
+	return nil
+}
+
+// LoginOwner authenticates against the agent-vault API with the owner
+// credentials and caches the returned session Bearer for subsequent settings
+// mutations (SetUnmatchedHostPolicy). Call once after EnsureOwner, only when at
+// least one agent is egress-contained. agent-vault v0.22.0 exposes no CLI for
+// the vault-settings PATCH, so the owner session must be obtained over the API.
+func LoginOwner(addr, email, password string) error {
+	if email == "" || password == "" {
+		return fmt.Errorf("agent-vault owner email and password required")
+	}
+	body, _ := json.Marshal(map[string]string{"email": email, "password": password})
+	req, err := http.NewRequest(http.MethodPost,
+		strings.TrimRight(addr, "/")+"/v1/auth/login", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("agent-vault owner login: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := avHTTPDo(req)
+	if err != nil {
+		return fmt.Errorf("agent-vault owner login: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("agent-vault owner login: status %d\n%s", resp.StatusCode, raw)
+	}
+	var parsed struct {
+		Token       string `json:"token"`
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return fmt.Errorf("agent-vault owner login: parsing response: %w", err)
+	}
+	ownerBearer = parsed.Token
+	if ownerBearer == "" {
+		ownerBearer = parsed.AccessToken
+	}
+	if ownerBearer == "" {
+		return fmt.Errorf("agent-vault owner login: no session token in response")
+	}
+	return nil
+}
+
+// SetUnmatchedHostPolicy sets a vault's unmatched-host policy ("deny" forbids any
+// host not covered by a service; "forward" — agent-vault's default — passes it
+// through). This is mandatory for an egress-contained agent: without it
+// agent-vault forwards unmatched hosts and containment is decorative. v0.22.0 has
+// no CLI flag for it, so it is applied over the API with the cached owner Bearer
+// (call LoginOwner first). Fails loudly — the caller must not proceed on error.
+func SetUnmatchedHostPolicy(addr, vaultName, policy string) error {
+	if ownerBearer == "" {
+		return fmt.Errorf("agent-vault: no owner session (call LoginOwner before SetUnmatchedHostPolicy)")
+	}
+	name := config.AgentVaultName(vaultName)
+	body, _ := json.Marshal(map[string]string{"unmatched_host_policy": policy})
+	req, err := http.NewRequest(http.MethodPatch,
+		strings.TrimRight(addr, "/")+"/v1/vaults/"+name+"/settings", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("agent-vault set unmatched-host policy for %s: %w", name, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+ownerBearer)
+	resp, err := avHTTPDo(req)
+	if err != nil {
+		return fmt.Errorf("agent-vault set unmatched-host policy for %s: %w", name, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("agent-vault set unmatched-host policy for %s: status %d\n%s", name, resp.StatusCode, raw)
 	}
 	return nil
 }

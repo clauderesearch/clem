@@ -240,11 +240,27 @@ type AgentConfig struct {
 	// than the main session. Accepts model aliases (sonnet, haiku, opus) or
 	// full IDs (claude-sonnet-4-6). Empty = inherit main model.
 	SubagentModel string `yaml:"subagent_model"`
-	// Effort caps extended-thinking budget per session via Claude Code's
-	// effortLevel setting. Accepts "low", "medium", "high", "xhigh", "max".
-	// Empty = use Claude Code's own default (currently medium). Lowering trims
-	// output tokens — the dominant cost driver in agent loops.
+	// Effort caps the runtime's reasoning budget per session. Clem translates
+	// this harness-neutral value to Claude Code's effortLevel or Codex's
+	// model_reasoning_effort. Accepts "low", "medium", "high", "xhigh", "max".
+	// For Codex, "max" maps to its equivalent "xhigh". Empty leaves the
+	// runtime default unchanged.
 	Effort string `yaml:"effort"`
+	// Headroom routes the claude-code session through a local Headroom
+	// proxy (pipx package headroom-ai) that compresses context before it
+	// reaches the API (~12% fewer tokens measured), stretching subscription
+	// rate limits. The runner falls back to a direct claude launch when the
+	// binary is missing. claude-code runtime only; ignored for opencode/codex.
+	Headroom bool `yaml:"headroom"`
+	// RTK installs the rtk output-filter CLI (github.com/rtk-ai/rtk) at
+	// provision: one pinned static binary at /usr/local/bin/rtk shared by
+	// all agents, plus rtk's PreToolUse hook in the agent's settings.json
+	// (60-90% fewer tokens on git/test/build output). The hook rewrites
+	// commands automatically under the claude-code runtime only; for
+	// codex/opencode it is inert but still installed — it silences rtk's
+	// per-command "No hook installed" hint, and those runtimes adopt rtk
+	// through prompt instructions instead.
+	RTK bool `yaml:"rtk"`
 	// GitName and GitEmail set the agent's git user identity during provision.
 	// Without these, commits are authored with whatever identity the OAuth login
 	// stored, which may leak the operator's personal email into public history.
@@ -293,7 +309,7 @@ type AgentConfig struct {
 	// gRPC credentials, WebSocket auth, non-secret usernames.
 	RevealSecrets []string `yaml:"reveal_secrets"`
 	// EgressRestrictionExperimental is DEPRECATED — superseded by the top-level
-	// egress block (pipelock + nftables). When set true it still opts the agent
+	// egress block (agent-vault + nftables). When set true it still opts the agent
 	// into egress containment (treated like egress: true) but Load logs a
 	// deprecation warning. The old hardcoded-CIDR systemd allowlist is gone.
 	//
@@ -572,15 +588,6 @@ func Load(path string) (*Config, error) {
 	if cfg.SkillsRepo != "" && !isPlausibleGitURL(cfg.SkillsRepo) {
 		return nil, fmt.Errorf("skills_repo %q is not a recognized git URL (expected https://, git://, ssh://, or git@host:path)", cfg.SkillsRepo)
 	}
-	switch cfg.Egress.Posture {
-	case "", "strict", "balanced", "audit":
-		// valid
-	default:
-		return nil, fmt.Errorf("egress.posture must be strict, balanced, or audit, got %q", cfg.Egress.Posture)
-	}
-	if cfg.Egress.ProxyPort != 0 && (cfg.Egress.ProxyPort < 1024 || cfg.Egress.ProxyPort > 65535) {
-		return nil, fmt.Errorf("egress.proxy_port must be 1024-65535, got %d", cfg.Egress.ProxyPort)
-	}
 	// Out-of-range entries would land verbatim in the nftables `tcp dport` set
 	// and make `nft -f` reject the whole ruleset (→ agents fail to start, since
 	// the firewall unit is a hard Requires=).
@@ -624,9 +631,13 @@ func Load(path string) (*Config, error) {
 		}
 	}
 	usedPorts := make(map[int]string)
-	// Reserve the egress proxy port so no agent's web terminal collides with it.
-	if cfg.Egress.Enabled {
-		usedPorts[cfg.Egress.ProxyPortOrDefault()] = "egress.proxy_port"
+	if cfg.Vault.IsAgentVault() {
+		// Reserved unconditionally (not just when mcp_sidecars is configured,
+		// see validateMCPSidecars) so a web_terminal_port collision with
+		// agent-vault's management or MITM port is caught regardless of
+		// whether the project uses MCP sidecars at all.
+		usedPorts[cfg.Vault.ManagementPortOrDefault()] = "agent-vault management port"
+		usedPorts[cfg.Vault.MITMPortOrDefault()] = "agent-vault MITM port"
 	}
 	for key, ac := range cfg.Agents {
 		if !validName.MatchString(key) {
@@ -681,19 +692,19 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("agent %s: effort must be low, medium, high, xhigh, or max, got %q", key, ac.Effort)
 		}
 		if ac.EgressRestrictionExperimental {
-			fmt.Fprintf(os.Stderr, "warning: agent %s: egress_restriction_experimental is deprecated — use the top-level egress: block (pipelock + nftables containment)\n", key)
+			fmt.Fprintf(os.Stderr, "warning: agent %s: egress_restriction_experimental is deprecated — use the top-level egress: block (agent-vault + nftables containment)\n", key)
+		}
+		// Egress containment is implemented via agent-vault (its TLS-MITM proxy
+		// is the only containment path — the per-agent HTTPS_PROXY points at
+		// agent-vault, unmatched hosts are denied, and the nftables UID firewall
+		// blocks every other route out). A contained agent that is not brokered
+		// would have no allowed egress path at all, so require vault_broker.
+		if cfg.EgressEnabledFor(key) && !ac.VaultBroker {
+			return nil, fmt.Errorf("agent %s: egress containment requires vault_broker (agent-vault is the containment proxy); set vault_broker: true (and vault.backend: agent-vault)", key)
 		}
 		if ac.VaultBroker {
 			if !cfg.Vault.IsAgentVault() {
 				return nil, fmt.Errorf("agent %s: vault_broker requires vault.backend: agent-vault", key)
-			}
-			// Brokering and pipelock egress containment are NOT composable in
-			// v1: a brokered agent's HTTPS_PROXY points at agent-vault (which
-			// agent-vault cannot chain through pipelock), so enabling both would
-			// silently route the agent's traffic around pipelock's allowlist and
-			// audit log. Reject the combination rather than weaken containment.
-			if cfg.EgressEnabledFor(key) {
-				return nil, fmt.Errorf("agent %s: vault_broker and egress containment cannot both be enabled (agent-vault cannot chain through pipelock); pick one per agent", key)
 			}
 			for _, s := range ac.BrokeredSecrets {
 				if UnbrokerableSecrets[s] {
