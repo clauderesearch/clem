@@ -184,7 +184,7 @@ func TestGenerateScript_OOMCheckPresent(t *testing.T) {
 		`check_oom()`,
 		`journalctl --since "$since" --no-pager`,
 		`killed by the OOM killer`,
-		`clem-${PROJECT}-[a-zA-Z0-9_-]+\.service`,
+		`(clem-watchdog-test\.service|clem-test-lead\.service)`,
 		`OOM-kill detected`,
 		`free -h`,
 	} {
@@ -206,13 +206,54 @@ func TestGenerateScript_OOMCheckPresent(t *testing.T) {
 // grep must match only this project's services, not every clem-* service
 // on the host (which double-reports OOM kills across co-located projects).
 func TestGenerateScript_OOMCheckScopedToProject(t *testing.T) {
-	s := GenerateScript(baseCfg())
-	re := regexp.MustCompile(`grep -oE "clem-\$\{PROJECT\}-\[a-zA-Z0-9_-\]\+\\.service"`)
-	if !re.MatchString(s) {
-		t.Errorf("expected project-scoped OOM service grep, got:\n%s", s)
+	cfg := baseCfg()
+	cfg.Project = "foo"
+	cfg.Agents["lead"] = config.AgentConfig{
+		Name: "Lead", Model: "claude-opus-4-7", Iteration: "1m", Prompt: "x", WebTerminalPort: 7681,
 	}
-	if strings.Contains(s, `grep -oE "clem-[a-zA-Z0-9_-]+\.service"`) {
-		t.Errorf("OOM grep must not match all clem-* services host-wide:\n%s", s)
+	cfg.Coordination.Backend = "github"
+	cfg.Coordination.GithubRepo = "owner/repo"
+	cfg.Vault.Backend = "agent-vault"
+	cfg.MCPSidecars.Servers = []config.SidecarServer{{
+		Name: "search", Identity: "shared", Command: "/usr/bin/search-mcp",
+		Secrets: []string{"SEARCH_TOKEN"}, SecretsVault: "shared",
+	}}
+	agent := cfg.Agents["lead"]
+	agent.Sidecars = []string{"search"}
+	enabled := true
+	agent.Egress = &enabled
+	cfg.Agents["lead"] = agent
+
+	pattern := oomServicePattern(cfg, []string{"lead"})
+	re := regexp.MustCompile(`^(?:` + pattern + `)$`)
+	for _, service := range []string{
+		"clem-foo-lead.service",
+		"clem-watchdog-foo.service",
+		"clem-ttyd-foo-lead.service",
+		"clem-github-watch-foo-lead.service",
+		"clem-nftables-foo.service",
+		"clem-agent-vault-foo.service",
+		"clem-mcp-foo-search.service",
+		"clem-sidecar-nft-foo.service",
+	} {
+		if !re.MatchString(service) {
+			t.Errorf("OOM pattern %q must match this project's unit %q", pattern, service)
+		}
+	}
+	for _, service := range []string{
+		"clem-foo-bar-lead.service",
+		"clem-watchdog-foo-bar.service",
+		"clem-agent-vault-foo-bar.service",
+		"clem-unrelated.service",
+	} {
+		if re.MatchString(service) {
+			t.Errorf("OOM pattern %q must not match another project's unit %q", pattern, service)
+		}
+	}
+
+	s := GenerateScript(cfg)
+	if !strings.Contains(s, `grep -oE "`+pattern+`"`) {
+		t.Errorf("generated script must use exact project service pattern %q:\n%s", pattern, s)
 	}
 
 	// marker must be written after the journalctl scan to avoid silently
