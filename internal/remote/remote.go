@@ -80,7 +80,7 @@ var remoteSSH = SSH
 
 // remoteSSHT is the TTY-SSH implementation used by Login.
 // Tests may replace it to simulate failures.
-var remoteSSHT func(host, command string) error = SSHT
+var remoteSSHT = SSHT
 
 // SSHT runs a command on the remote host with a TTY allocated (required for interactive prompts).
 func SSHT(host, command string) error {
@@ -169,7 +169,10 @@ func Login(host string, agents []string) error {
 	fmt.Printf("Remote: %s\n\n", host)
 	loginCmd := fmt.Sprintf("cd ~/%s && clem login", repoName)
 	if len(agents) > 0 {
-		loginCmd += " " + strings.Join(agents, " ")
+		// The option terminator is defense in depth: agent keys currently cannot
+		// begin with '-', but a future grammar expansion must not turn a
+		// positional agent selector into a remote Clem flag.
+		loginCmd += " -- " + strings.Join(agents, " ")
 	}
 	if err := remoteSSHT(host, loginCmd); err != nil {
 		return fmt.Errorf("remote login: %w\nManual: ssh -t %s '%s'", err, host, loginCmd)
