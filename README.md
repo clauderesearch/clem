@@ -26,7 +26,7 @@
 
 `clem` runs a team of Claude Code agents 24/7 on any Linux host. Each agent is a separate OS user in a tmux session under systemd. Agents coordinate over **Discord, Slack, or GitHub Issues**, pick up tasks, write code, and open PRs. A watchdog restarts anything that crashes. You write one clem.yaml; clem provisions the OS users and keeps them running.
 
-What sets it apart: **secrets and egress are contained at the OS layer, not by the agent's cooperation.** Each agent takes one disposition — a per-UID kernel firewall that forces all egress through an auditing proxy (a non-root agent can't disable a firewall it doesn't own), *or* a secret-zero broker that hands it only placeholders while a separate user injects the real credential on egress. Enforced by the kernel and a separate user, not by the agent. See the [security model](#security-model).
+What sets it apart: **selected secrets and egress can be contained at the OS layer, not by the agent's cooperation.** A secret-zero broker hands the agent placeholders for configured HTTP credentials while a separate user injects the real values on outbound requests. Optional egress containment builds on that same broker: a per-UID kernel firewall forces all traffic through agent-vault's TLS-MITM proxy, which allowlists approved hosts and denies the rest (a non-root agent can't disable a firewall it doesn't own). See the [security model](#security-model).
 
 ---
 
@@ -38,7 +38,7 @@ What sets it apart: **secrets and egress are contained at the OS layer, not by t
 | **Kernel egress containment** | Per-agent nftables UID firewall forces all traffic through a loopback proxy; a non-root agent can't disable a firewall it doesn't own. No in-process escape hatch. Opt-in `egress:` block. |
 | **Secret-zero brokering** | Brokered agents hold placeholders + a scoped inject-only token; real credentials live in a vault owned by a *separate* user and are injected on egress. `cat ~/.env` yields nothing usable for the brokered keys. |
 | **Multi-backend coordination** | Discord, Slack, or GitHub Issues via swappable `coordination.backend:` in `clem.yaml`. One config knob. |
-| **Multi-runtime** | `runtime: claude-code \| opencode`. Mix Anthropic cloud, Bedrock, Vertex, Ollama, OpenAI-compat - one surface. |
+| **Multi-runtime** | `runtime: claude-code \| opencode \| codex`. Mix Anthropic cloud, ChatGPT OAuth, Bedrock, Vertex, Ollama, and OpenAI-compatible providers behind one team definition. |
 | **Encrypted secrets** | Per-agent `.env` materialised from age/sops vaults at provision time. Never leave the host after. |
 | **Self-healing** | systemd + tmux per agent. Watchdog timer restarts dead or stalled sessions. Alerts fire only after repeated failures. |
 | **Bring your own model** | Default Claude; one flag away from Ollama Cloud / Bedrock / Vertex / local models. Tested end-to-end on local Gemma 4 (E4B QAT via Ollama). |
@@ -92,7 +92,7 @@ What sets it apart: **secrets and egress are contained at the OS layer, not by t
           └────────────────────────────────────┘
 ```
 
-Each agent runs a loop: launch `claude` (or `opencode`), inject a prompt, wait for the session to finish (up to 2h hard cap), sleep the configured `iteration` duration, repeat. Secrets live encrypted in `secrets.sops.yaml` (age/sops); `clem provision` decrypts them into per-agent `.env` files on the host.
+Each agent runs a loop: launch `claude`, `opencode`, or `codex`, inject a prompt, wait for the session to finish (up to 2h hard cap), sleep the configured `iteration` duration, repeat. Secrets live encrypted in `secrets.sops.yaml` (age/sops); `clem provision` decrypts them into per-agent `.env` files on the host.
 
 ---
 
@@ -105,16 +105,16 @@ An autonomous agent is an untrusted workload: prompt injection, a poisoned depen
 | **broker** | a credential proxy (separate UID) injects the real value into the agent's own outbound HTTPS | inside the broker | API-key / bearer exfiltration — the agent only holds a placeholder |
 | **sidecar** | a secret-holding MCP server runs as a *separate* user; the agent calls it over loopback and gets a result, never the key | inside the sidecar | non-HTTP creds (gateway tokens, internal DBs) and scoped/read-only access |
 | **remove** | drop the credential/MCP entirely | nowhere | unused attack surface |
-| **egress firewall** | per-agent nftables UID rule forces all traffic through a loopback proxy; everything else is rejected by the kernel | n/a | data exfiltration to unapproved hosts |
+| **egress firewall** | per-agent nftables UID rule forces all traffic through agent-vault's loopback TLS-MITM, which allowlists approved hosts and denies the rest; everything else is rejected by the kernel (requires `vault_broker`) | n/a | data exfiltration to unapproved hosts |
 
-**Why this is stronger than in-process or single-container sandboxes:** each agent takes one disposition — a **per-OS-UID kernel firewall a non-root agent cannot disable**, *or* a credential broker running as a **different user the agent cannot read**. Neither depends on the agent's cooperation, there is no in-process escape hatch, and a fleet freely mixes both dispositions across agents.
+**Why this is stronger than in-process or single-container sandboxes:** credential brokering keeps configured HTTP secrets under a **different OS user the agent cannot read**. Egress containment can be layered on top with a **per-OS-UID kernel firewall a non-root agent cannot disable**. Neither boundary relies on an in-process switch. A brokered-only agent still has unrestricted network access; an egress-contained agent is also brokered and can reach only approved hosts.
 
-Honest about the parts that are borrowed: the egress proxy and credential broker are battle-tested OSS primitives ([pipelock](https://github.com/luckyPipewrench/pipelock), [Infisical agent-vault](https://github.com/Infisical/agent-vault)). clem's contribution is the **OS-level composition** — per-agent UID identity wired to whichever boundary applies, so the agent cannot route around it.
+Honest about the parts that are borrowed: the credential broker *and* the TLS-MITM egress proxy are one battle-tested OSS primitive ([Infisical agent-vault](https://github.com/Infisical/agent-vault)); the kernel boundary is nftables. clem's contribution is the **OS-level composition** — per-agent UID identity + isolated secret supply, with optional kernel routing that the agent cannot bypass.
 
 → Full threat model, guarantees, and known limitations: **[docs/threat-model.md](docs/threat-model.md)**.
 → Worked reference config: **[samples/secure-fleet/](samples/secure-fleet/)**.
 
-Both layers are **opt-in and default-off**; existing fleets are unaffected until you enable `egress:` / `vault.backend: agent-vault`.
+Both layers are **opt-in and default-off**; existing fleets are unaffected until you enable `vault.backend: agent-vault` (brokering) and, on top of it, the `egress:` block (containment requires `vault_broker`).
 
 ---
 
@@ -212,7 +212,7 @@ sudo clem provision
 sudo clem login
 
 # 8. start and check
-sudo clem up
+sudo clem start
 clem status
 ```
 
@@ -366,8 +366,9 @@ clem vault list                    List all vaults and their keys (values hidden
 clem vault delete <vault> [KEY]    Delete a secret or entire vault
 clem provision [--remote HOST]     Create OS users, write .env, install services (root)
 clem login [agent...]              Run `claude /login` as each agent (one-time)
-clem up [agent...]                 Start agent systemd services (root)
-clem down [agent...]               Stop agent systemd services (root)
+clem start                         Start all agents; enables units, arms watchdog (root)
+clem stop                          Stop all agents; disables units so nothing restarts them (root)
+clem restart                       Stop, then start (root)
 clem status                        Table: systemd · tmux · token expiry · last log
 clem logs <agent>                  Tail an agent's runner log
 ```
@@ -407,7 +408,7 @@ agents:
     subagent_model: string  # optional - CLAUDE_CODE_SUBAGENT_MODEL for Task tool / Explore / general-purpose; defaults to claude-sonnet-4-6; set to "off" to inherit main model
     provider: string        # optional - anthropic (default) | bedrock | vertex | ollama | openai-compat
     provider_url: string    # required when provider is ollama or openai-compat
-    runtime: string         # optional - claude-code (default) | opencode
+    runtime: string         # optional - claude-code (default) | opencode | codex
 ```
 
 **Runtimes:**
@@ -416,6 +417,7 @@ agents:
 |---------------|-------------------------------------|-------------------------------------------------------------------------------------|
 | `claude-code` | `~/.local/bin/claude`               | Default. Anthropic-native wire format. Best for cloud Claude.                       |
 | `opencode`    | `~/.opencode/bin/opencode`          | Talks natively to 75+ providers via models.dev. Better tool-use on local models.   |
+| `codex`       | `~/.npm-global/bin/codex`           | OpenAI Codex CLI. Supports ChatGPT OAuth or `OPENAI_API_KEY`.                       |
 
 **Providers:**
 
@@ -462,7 +464,7 @@ Remote provisioning flow:
 # on your local machine, inside your team repo
 clem provision --remote root@<vps-ip> --gh-token ghp_...
 clem login --remote root@<vps-ip>
-ssh <vps-ip> "cd my-team && clem up && clem status"
+ssh <vps-ip> "cd my-team && clem start && clem status"
 ```
 
 See [docs/hetzner.md](docs/hetzner.md) for a Hetzner-specific walkthrough (cloud-init, `hcloud` CLI, SSH config).

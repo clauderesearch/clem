@@ -14,6 +14,17 @@ func validateRepoName(name string) error {
 	return nil
 }
 
+// Keep this grammar aligned with config.validName: these values are forwarded
+// to a remote Clem instance before its configuration is available locally.
+var validAgentKey = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
+
+func validateAgentKey(key string) error {
+	if !validAgentKey.MatchString(key) {
+		return fmt.Errorf("agent key must match %s, got %q", validAgentKey.String(), key)
+	}
+	return nil
+}
+
 // ValidatedRepoName returns RepoName after rejecting shell-metacharacter payloads.
 func ValidatedRepoName() (string, error) {
 	name, err := RepoName()

@@ -44,7 +44,6 @@ tail -500 "$LOGFILE" > "$LOGFILE.tmp" 2>/dev/null && mv "$LOGFILE.tmp" "$LOGFILE
 export ENABLE_CLAUDEAI_MCP_SERVERS=false
 # Skip IDE extension auto-install probe — agents run in headless tmux, no IDE.
 export CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL=1
-{{.ProxyExport}}
 # Load secrets (written by clem provision, never committed)
 [ -f "$HOME/.env" ] && source "$HOME/.env"
 {{.SubagentExport}}
@@ -140,7 +139,7 @@ while true; do
         fi
     fi
 
-    # claude install (bun fetch) can't traverse the pipelock proxy — it fails
+    # claude install (bun fetch) can't traverse the egress proxy — it fails
     # "Socket is closed" every iteration on egress-contained hosts. Skip it
     # there; updates for contained agents happen at (re)provision time.
     if [ -n "$HTTPS_PROXY" ]; then
@@ -190,14 +189,17 @@ while true; do
     fi
 
     # Per-iteration effort override: the agent writes low|medium|high|xhigh
-    # to ~/.claude/next-effort during an iteration; consumed (and deleted)
-    # here. CLAUDE_CODE_EFFORT_LEVEL is session-scoped and outranks settings
+    # to the harness-neutral ~/.clem/next-effort during an iteration; consumed
+    # (and deleted) here. The legacy Claude path remains supported.
+    # CLAUDE_CODE_EFFORT_LEVEL is session-scoped and outranks settings
     # files, so an absent file simply means settings.json effortLevel
     # applies — no reset bookkeeping, no drift across iterations.
     unset CLAUDE_CODE_EFFORT_LEVEL
-    if [ -f "$HOME/.claude/next-effort" ]; then
-        NEXT_EFFORT=$(tr -cd 'a-z' < "$HOME/.claude/next-effort" | head -c 16)
-        rm -f "$HOME/.claude/next-effort"
+    NEXT_EFFORT_FILE="$HOME/.clem/next-effort"
+    [ -f "$NEXT_EFFORT_FILE" ] || NEXT_EFFORT_FILE="$HOME/.claude/next-effort"
+    if [ -f "$NEXT_EFFORT_FILE" ]; then
+        NEXT_EFFORT=$(tr -cd 'a-z' < "$NEXT_EFFORT_FILE" | head -c 16)
+        rm -f "$NEXT_EFFORT_FILE"
         case "$NEXT_EFFORT" in
             low|medium|high|xhigh)
                 export CLAUDE_CODE_EFFORT_LEVEL="$NEXT_EFFORT"
@@ -224,7 +226,8 @@ while true; do
     # shows a persistent "Auto-update failed" banner. On non-proxy hosts updates
     # still happen via the explicit "claude install" above; proxy hosts skip it
     # (same bun fetch limitation) and update at provision time.
-    DISABLE_AUTOUPDATER=1 timeout 7200 $CLAUDE --dangerously-skip-permissions \
+{{.HeadroomLaunch}}
+    DISABLE_AUTOUPDATER=1 timeout 7200 $LAUNCH --dangerously-skip-permissions \
         --model '{{.Model}}' \
         --name '{{.AgentName}}' \
         --add-dir ~/.claude
@@ -240,7 +243,7 @@ while true; do
         SLEEP_BETWEEN=$SLEEP_NIGHT
     fi
 
-    if [ $EXIT_CODE -eq 143 ] || [ $ELAPSED -gt $RESET_AFTER ]; then
+    if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 143 ] || [ $ELAPSED -gt $RESET_AFTER ]; then
         BACKOFF=$SLEEP_BETWEEN
     else
         BACKOFF=$(( BACKOFF * 2 ))
@@ -271,7 +274,6 @@ cd "$WORKDIR" || exit 1
 log() { echo "$(date -Iseconds) $1" | tee -a "$LOGFILE"; }
 
 tail -500 "$LOGFILE" > "$LOGFILE.tmp" 2>/dev/null && mv "$LOGFILE.tmp" "$LOGFILE" 2>/dev/null
-{{.ProxyExport}}
 [ -f "$HOME/.env" ] && source "$HOME/.env"
 {{.SubagentExport}}
 # Write opencode.json with Ollama provider + discord-bot MCP (if token is set).
@@ -322,6 +324,24 @@ if _backend != 'github' and os.environ.get('SLACK_MCP_XOXP_TOKEN'):
             'SLACK_MCP_ADD_MESSAGE_TOOL': os.environ.get('SLACK_MCP_ADD_MESSAGE_TOOL', 'true'),
         },
     }
+# Merge Clem's runtime-neutral extension MCP manifest.
+_managed_mcp = os.path.expanduser('~/.clem/mcp-servers.json')
+if os.path.exists(_managed_mcp):
+    with open(_managed_mcp) as f:
+        for name, entry in json.load(f).items():
+            if entry.get('type') == 'stdio':
+                cfg['mcp'][name] = {
+                    'type': 'local',
+                    'command': [entry['command']] + entry.get('args', []),
+                    'enabled': True,
+                    'environment': entry.get('env', {}),
+                }
+            else:
+                cfg['mcp'][name] = {
+                    'type': 'remote',
+                    'url': entry['url'],
+                    'enabled': True,
+                }
 print(json.dumps(cfg, indent=2))
 " > "$WORKDIR/opencode.json"
 
@@ -368,7 +388,7 @@ while true; do
         SLEEP_BETWEEN=$SLEEP_NIGHT
     fi
 
-    if [ $EXIT_CODE -eq 143 ] || [ $ELAPSED -gt $RESET_AFTER ]; then
+    if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 143 ] || [ $ELAPSED -gt $RESET_AFTER ]; then
         BACKOFF=$SLEEP_BETWEEN
     else
         BACKOFF=$(( BACKOFF * 2 ))
@@ -393,6 +413,7 @@ BACKOFF=10
 MAX_BACKOFF=900
 RESET_AFTER=300
 CODEX="$HOME/.npm-global/bin/codex"
+CODEX_UPDATER="$HOME/.local/bin/clem-codex-update"
 WORKDIR="$HOME/{{.Project}}"
 LOGFILE="$HOME/.claude/{{.AgentKey}}-runner.log"
 
@@ -402,7 +423,6 @@ cd "$WORKDIR" || exit 1
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGFILE"; }
 tail -500 "$LOGFILE" > "$LOGFILE.tmp" 2>/dev/null && mv "$LOGFILE.tmp" "$LOGFILE" 2>/dev/null
 
-{{.ProxyExport}}
 # Load secrets (written by clem provision, never committed) before the config
 # writer reads them from the environment.
 [ -f "$HOME/.env" ] && source "$HOME/.env"
@@ -424,6 +444,8 @@ lines = []
 lines.append('cli_auth_credentials_store = \"file\"')
 lines.append('mcp_oauth_credentials_store = \"file\"')
 lines.append('forced_login_method = \"chatgpt\"')
+{{.CodexEffortConfig}}
+lines.append('check_for_update_on_startup = false')
 lines.append('')
 # Trust the work directory so project-scoped config layers load without a prompt.
 lines.append('[projects.' + _s(os.path.expanduser('~/{{.Project}}')) + ']')
@@ -464,6 +486,16 @@ if os.environ.get('TYPEFULLY_API_KEY'):
 # Privileged MCP sidecars over loopback streamable-HTTP (codex supports url MCP).
 for _name, _port in {{.SidecarServers}}:
     _http(_name, 'http://127.0.0.1:%d/mcp' % _port)
+# Merge Clem's runtime-neutral extension MCP manifest.
+_managed_mcp = os.path.expanduser('~/.clem/mcp-servers.json')
+if os.path.exists(_managed_mcp):
+    import json
+    with open(_managed_mcp) as f:
+        for name, entry in json.load(f).items():
+            if entry.get('type') == 'stdio':
+                _stdio(name, entry['command'], entry.get('args'), entry.get('env'))
+            else:
+                _http(name, entry['url'])
 open(os.path.expanduser('~/.codex/config.toml'), 'w').write('\n'.join(lines) + '\n')
 "
 
@@ -486,12 +518,27 @@ while true; do
         fi
     fi
 
-    log "Updating codex"
-    npm install -g @openai/codex@latest 2>&1 | tail -3 | tee -a "$LOGFILE" || log "codex update failed, continuing with current version"
+    "$CODEX_UPDATER" update 2>&1 | tee -a "$LOGFILE" || log "codex update failed, continuing with current validated version"
 
     {{.SkillsSyncCmd}}
 
     [ -n "$RUNNER_WARNINGS" ] && PROMPT="${RUNNER_WARNINGS}${PROMPT}"
+
+    # One-session reasoning override written by the shared effort-control skill.
+    # Arrays preserve the TOML string as one -c argument.
+    CODEX_EFFORT_ARGS=()
+    NEXT_EFFORT_FILE="$HOME/.clem/next-effort"
+    if [ -f "$NEXT_EFFORT_FILE" ]; then
+        NEXT_EFFORT=$(tr -cd 'a-z' < "$NEXT_EFFORT_FILE" | head -c 16)
+        rm -f "$NEXT_EFFORT_FILE"
+        case "$NEXT_EFFORT" in
+            low|medium|high|xhigh)
+                CODEX_EFFORT_ARGS=(-c "model_reasoning_effort=\"$NEXT_EFFORT\"")
+                log "Effort override for this session: $NEXT_EFFORT" ;;
+            *)
+                log "Ignoring invalid next-effort value: $NEXT_EFFORT" ;;
+        esac
+    fi
 
     log "Starting {{.AgentName}} (fresh session)"
     # Claude Code debounces large multi-line pastes: a single Enter sent right
@@ -501,16 +548,28 @@ while true; do
     # submits the input box is empty and any further Enter is a harmless no-op.
     (sleep 1 && tmux send-keys -t {{.AgentKey}} "" Enter
      sleep 25 && tmux send-keys -l -t {{.AgentKey}} "$PROMPT"
+     # A literal '$' in shell instructions opens Codex's skill picker. Close
+     # any mention picker before attempting submission.
+     sleep 1 && tmux send-keys -t {{.AgentKey}} Escape
      for _ in 1 2 3 4 5; do sleep 3; tmux send-keys -t {{.AgentKey}} Enter; done) &
     MODEL_ARG=""
     [ -n '{{.Model}}' ] && MODEL_ARG="--model {{.Model}}"
+    PROMOTED_VERSION=$(cat "$HOME/.npm-global/codex/state/promoted" 2>/dev/null || true)
     timeout 7200 "$CODEX" --dangerously-bypass-approvals-and-sandbox \
         $MODEL_ARG \
+        "${CODEX_EFFORT_ARGS[@]}" \
         -C "$WORKDIR"
 
     EXIT_CODE=$?
     ELAPSED=$(( $(date +%s) - START ))
     log "Exited $EXIT_CODE after ${ELAPSED}s"
+
+    if [ $EXIT_CODE -ne 0 ] && [ $ELAPSED -lt 25 ] && [ -n "$PROMOTED_VERSION" ]; then
+        log "Codex $PROMOTED_VERSION exited before prompt injection; rolling back and quarantining"
+        "$CODEX_UPDATER" rollback-early "$PROMOTED_VERSION" 2>&1 | tee -a "$LOGFILE"
+    elif [ $ELAPSED -ge 25 ] && [ -n "$PROMOTED_VERSION" ]; then
+        "$CODEX_UPDATER" clear-promotion
+    fi
 
     HOUR=$(date +%H)
     if [ "$HOUR" -ge 7 ] && [ "$HOUR" -lt 22 ]; then
@@ -519,7 +578,7 @@ while true; do
         SLEEP_BETWEEN=$SLEEP_NIGHT
     fi
 
-    if [ $EXIT_CODE -eq 143 ] || [ $ELAPSED -gt $RESET_AFTER ]; then
+    if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 143 ] || [ $ELAPSED -gt $RESET_AFTER ]; then
         BACKOFF=$SLEEP_BETWEEN
     else
         BACKOFF=$(( BACKOFF * 2 ))
@@ -556,13 +615,13 @@ WantedBy=multi-user.target
 // egressDirectives is the systemd IP-firewall block injected when egress
 // containment is enabled for an agent. It is intentionally loopback-only:
 // hard enforcement (and the domain allowlist) lives in the clem-nftables UID
-// firewall + pipelock proxy. This systemd block is a cheap second kernel layer
-// that blocks all direct internet egress even if the nftables ruleset is
-// flushed. There are no hardcoded CIDRs to drift — the agent reaches the
-// internet only via the loopback pipelock proxy.
+// firewall + agent-vault's TLS-MITM proxy. This systemd block is a cheap second
+// kernel layer that blocks all direct internet egress even if the nftables
+// ruleset is flushed. There are no hardcoded CIDRs to drift — the agent reaches
+// the internet only via the loopback agent-vault proxy.
 const egressDirectives = `# Egress containment (egress: enabled). Hard enforcement + domain allowlist
-# live in the clem-nftables UID firewall and the pipelock proxy. This block is
-# a second kernel layer blocking direct internet egress.
+# live in the clem-nftables UID firewall and agent-vault's TLS-MITM proxy. This
+# block is a second kernel layer blocking direct internet egress.
 IPAddressDeny=any
 IPAddressAllow=127.0.0.0/8
 IPAddressAllow=::1/128
@@ -597,6 +656,7 @@ type RunnerParams struct {
 	AgentKey            string
 	AgentName           string
 	Model               string
+	CodexEffortConfig   string
 	SubagentExport      string
 	Prompt              string
 	OSUser              string
@@ -610,11 +670,8 @@ type RunnerParams struct {
 	EgressDirectives    string
 	HardeningDirectives string
 	ResourceDirectives  string
-	// ProxyExport is the HTTPS_PROXY/NO_PROXY export block injected into the
-	// runner when egress containment is enabled for the agent. Empty otherwise.
-	ProxyExport string
 	// ProxyUnitDeps is the After=/Wants= block tying the agent service to the
-	// pipelock + nftables units when egress containment is enabled.
+	// agent-vault + nftables units when egress containment is enabled.
 	ProxyUnitDeps string
 	// WatchChannelIDs is the comma-separated list of Discord channel IDs the
 	// MCP server's gateway watcher should observe. Empty disables the watcher
@@ -636,6 +693,36 @@ type RunnerParams struct {
 	// the work dir (CLAUDE.local.md for claude-code, AGENTS.md for opencode/codex).
 	// Used by the oversize guard so it checks the file the runtime actually reads.
 	InstructionFile string
+	// HeadroomLaunch is the bash snippet that sets $LAUNCH to either the
+	// plain claude binary or a `headroom wrap claude` invocation when the
+	// agent has headroom: true. claude-code template only.
+	HeadroomLaunch string
+}
+
+// headroomLaunchSnippet returns the bash block that sets $LAUNCH for the
+// claude-code runner. With headroom enabled, the session is wrapped in
+// `headroom wrap claude` — a local context-compression proxy that trims
+// tokens before they reach the API, stretching subscription rate limits.
+// The proxy port is picked fresh each iteration so multiple agents on one
+// host never collide, and a missing binary falls back to a direct launch so
+// a failed install never strands the agent. wrap resolves 'claude' via
+// PATH, hence the export.
+func headroomLaunchSnippet(enabled bool) string {
+	if !enabled {
+		return `    LAUNCH="$CLAUDE"`
+	}
+	return `    if [ -x "$HOME/.local/bin/headroom" ]; then
+        export PATH="$HOME/.local/bin:$PATH"
+        HEADROOM_PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+        # wrap's 'claude mcp add' is a no-op when the server already exists,
+        # leaving HEADROOM_PROXY_URL pinned to a dead port from a prior
+        # iteration; remove it so wrap re-adds with this iteration's port.
+        "$CLAUDE" mcp remove headroom >/dev/null 2>&1 || true
+        LAUNCH="$HOME/.local/bin/headroom wrap claude -p $HEADROOM_PORT --no-context-tool --no-serena"
+    else
+        log "headroom enabled but not installed; launching claude directly"
+        LAUNCH="$CLAUDE"
+    fi`
 }
 
 // bashDoubleQuoteEscaper escapes the four characters that stay live inside a
@@ -712,15 +799,16 @@ func Generate(cfg *config.Config, agentKey string) string {
 		)
 	}
 	p := RunnerParams{
-		Project:        cfg.Project,
-		AgentKey:       agentKey,
-		AgentName:      ac.Name,
-		Model:          ac.Model,
-		SubagentExport: subagentExport,
-		Prompt:         strings.ReplaceAll(promptText, "'", `'\''`),
-		OSUser:         cfg.OSUsername(agentKey),
-		HomeDir:        fmt.Sprintf("/home/%s", cfg.OSUsername(agentKey)),
-		SleepActive: iterSec,
+		Project:           cfg.Project,
+		AgentKey:          agentKey,
+		AgentName:         ac.Name,
+		Model:             ac.Model,
+		CodexEffortConfig: codexEffortConfig(ac),
+		SubagentExport:    subagentExport,
+		Prompt:            strings.ReplaceAll(promptText, "'", `'\''`),
+		OSUser:            cfg.OSUsername(agentKey),
+		HomeDir:           fmt.Sprintf("/home/%s", cfg.OSUsername(agentKey)),
+		SleepActive:       iterSec,
 		// Night sleep defaults to the active value; iteration_night overrides.
 		// History: a hardcoded 2x night doubler was removed on the belief the
 		// prompt-cache TTL was 5 min. Subscription Claude Code actually gets
@@ -732,10 +820,10 @@ func Generate(cfg *config.Config, agentKey string) string {
 		WatchChannelIDs:     watchChannelIDs(cfg),
 		CoordinationBackend: cfg.Coordination.BackendOrDefault(),
 		GitHubWatchUnitDeps: githubWatchUnitDeps(cfg, agentKey),
-		ProxyExport:         proxyExportBlock(cfg, agentKey),
 		SidecarServers:      sidecarServersLiteral(cfg, agentKey),
 		SkillsSyncCmd:       skillsSyncCmd,
 		InstructionFile:     ac.InstructionFileName(),
+		HeadroomLaunch:      headroomLaunchSnippet(ac.Headroom),
 	}
 	switch ac.RuntimeKind() {
 	case "opencode":
@@ -794,32 +882,15 @@ func buildHardeningDirectives(homeDir, _ string) string {
 	)
 }
 
-// proxyExportBlock returns the HTTPS_PROXY/NO_PROXY export injected into the
-// runner when egress containment is enabled for the agent. Exported before
-// sourcing $HOME/.env so an operator can still override per-host. Empty when
-// containment is disabled. NO_PROXY keeps loopback (Ollama, MCP sockets) direct.
-func proxyExportBlock(cfg *config.Config, agentKey string) string {
-	if !cfg.EgressEnabledFor(agentKey) {
-		return ""
-	}
-	port := cfg.Egress.ProxyPortOrDefault()
-	return fmt.Sprintf(`# Egress containment: route HTTP(S) through the pipelock proxy. The nftables
-# UID firewall blocks all other egress, so this loopback proxy is the only way
-# out. NO_PROXY keeps loopback (Ollama, MCP sockets) direct.
-export HTTPS_PROXY=http://127.0.0.1:%d
-export HTTP_PROXY=http://127.0.0.1:%d
-export NO_PROXY=127.0.0.1,localhost,::1`, port, port)
-}
-
 // proxyUnitDeps returns the [Unit] dependency block tying the agent service to
 // the egress stack. The nftables firewall is a hard Requires= (fail-CLOSED: if
-// the firewall fails to load, the agent must not start unconfined). The
-// pipelock proxy is a soft Wants= — losing it costs connectivity, not
-// containment. After= orders the agent behind both so the boundary is up first.
+// the firewall fails to load, the agent must not start unconfined). agent-vault
+// is a soft Wants= — losing it costs connectivity, not containment. After=
+// orders the agent behind both so the boundary is up first.
 func proxyUnitDeps(cfg *config.Config) string {
 	return fmt.Sprintf("Requires=%s\nWants=%s\nAfter=%s %s\n",
-		cfg.NftablesServiceName(), cfg.PipelockServiceName(),
-		cfg.PipelockServiceName(), cfg.NftablesServiceName())
+		cfg.NftablesServiceName(), cfg.AgentVaultServiceName(),
+		cfg.AgentVaultServiceName(), cfg.NftablesServiceName())
 }
 
 // GenerateService renders the systemd service unit content for an agent.
@@ -878,7 +949,9 @@ func renderTemplate(tmpl string, p RunnerParams) string {
 		"{{.AgentKey}}", p.AgentKey,
 		"{{.AgentName}}", p.AgentName,
 		"{{.Model}}", p.Model,
+		"{{.CodexEffortConfig}}", p.CodexEffortConfig,
 		"{{.Prompt}}", p.Prompt,
+		"{{.HeadroomLaunch}}", p.HeadroomLaunch,
 		"{{.OSUser}}", p.OSUser,
 		"{{.HomeDir}}", p.HomeDir,
 		"{{.SleepActive}}", fmt.Sprintf("%d", p.SleepActive),
@@ -892,7 +965,6 @@ func renderTemplate(tmpl string, p RunnerParams) string {
 		"{{.HardeningDirectives}}", p.HardeningDirectives,
 		"{{.ResourceDirectives}}", p.ResourceDirectives,
 		"{{.WatchChannelIDs}}", p.WatchChannelIDs,
-		"{{.ProxyExport}}", p.ProxyExport,
 		"{{.ProxyUnitDeps}}", p.ProxyUnitDeps,
 		"{{.SidecarServers}}", p.SidecarServers,
 		"{{.CoordinationBackend}}", p.CoordinationBackend,
@@ -901,6 +973,26 @@ func renderTemplate(tmpl string, p RunnerParams) string {
 		"{{.InstructionFile}}", p.InstructionFile,
 	)
 	return r.Replace(tmpl)
+}
+
+// codexEffort translates Clem's harness-neutral effort vocabulary to Codex's.
+// Claude Code accepts "max" while Codex calls the same top tier "xhigh".
+func codexEffort(ac config.AgentConfig) string {
+	if ac.RuntimeKind() != "codex" {
+		return ""
+	}
+	if ac.Effort == "max" {
+		return "xhigh"
+	}
+	return ac.Effort
+}
+
+func codexEffortConfig(ac config.AgentConfig) string {
+	effort := codexEffort(ac)
+	if effort == "" {
+		return ""
+	}
+	return fmt.Sprintf(`lines.append('model_reasoning_effort = \"%s\"')`, effort)
 }
 
 // sidecarServersLiteral renders the Python list literal of [toolName, port]
