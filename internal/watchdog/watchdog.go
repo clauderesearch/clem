@@ -2,6 +2,7 @@ package watchdog
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -147,7 +148,7 @@ check_oom() {
     local hits
     hits=$(journalctl --since "$since" --no-pager 2>/dev/null \
         | grep -E "killed by the OOM killer" \
-        | grep -oE "clem-[a-zA-Z0-9_-]+\.service" \
+        | grep -oE "{{.OOMServicePattern}}" \
         | sort | uniq -c | awk '{printf "%s x%s\n", $2, $1}')
     if [ -n "$hits" ]; then
         local mem
@@ -275,17 +276,18 @@ const staleMarginSeconds = 300
 const staleFloorSeconds = 1800
 
 type watchdogParams struct {
-	Project         string
-	AgentHomes      string
-	EnvSource       string
-	AlertChannel    string
-	TokenEnvVar     string
-	AlertCurl       string
-	AgentChecks     string
-	VaultCheckDef   string
-	VaultInvoke     string
-	DenyCheckDef    string
-	DenyCheckInvoke string
+	Project           string
+	AgentHomes        string
+	EnvSource         string
+	AlertChannel      string
+	TokenEnvVar       string
+	AlertCurl         string
+	AgentChecks       string
+	VaultCheckDef     string
+	VaultInvoke       string
+	DenyCheckDef      string
+	DenyCheckInvoke   string
+	OOMServicePattern string
 }
 
 // anyEgressEnabled reports whether at least one agent has egress containment on.
@@ -378,17 +380,18 @@ func GenerateScript(cfg *config.Config) string {
 	}
 
 	p := watchdogParams{
-		Project:         cfg.Project,
-		EnvSource:       envSource,
-		AlertChannel:    alertChannel,
-		TokenEnvVar:     backend.TokenEnvVar,
-		AlertCurl:       alertCurl,
-		AgentChecks:     strings.TrimRight(checks.String(), "\n"),
-		AgentHomes:      agentHomes(cfg, keys),
-		VaultCheckDef:   vaultDef,
-		VaultInvoke:     vaultInvoke,
-		DenyCheckDef:    denyCheckDef,
-		DenyCheckInvoke: denyCheckInvoke,
+		Project:           cfg.Project,
+		EnvSource:         envSource,
+		AlertChannel:      alertChannel,
+		TokenEnvVar:       backend.TokenEnvVar,
+		AlertCurl:         alertCurl,
+		AgentChecks:       strings.TrimRight(checks.String(), "\n"),
+		AgentHomes:        agentHomes(cfg, keys),
+		VaultCheckDef:     vaultDef,
+		VaultInvoke:       vaultInvoke,
+		DenyCheckDef:      denyCheckDef,
+		DenyCheckInvoke:   denyCheckInvoke,
+		OOMServicePattern: oomServicePattern(cfg, keys),
 	}
 
 	r := strings.NewReplacer(
@@ -403,8 +406,44 @@ func GenerateScript(cfg *config.Config) string {
 		"{{.VaultInvoke}}", p.VaultInvoke,
 		"{{.DenyCheckDef}}", p.DenyCheckDef,
 		"{{.DenyCheckInvoke}}", p.DenyCheckInvoke,
+		"{{.OOMServicePattern}}", p.OOMServicePattern,
 	)
 	return r.Replace(watchdogScript)
+}
+
+// oomServicePattern returns an exact alternation of the systemd services this
+// project provisions. Concrete names avoid both cross-project attribution
+// (including project names sharing a hyphenated prefix) and false negatives
+// for infrastructure units whose project name does not follow "clem-".
+func oomServicePattern(cfg *config.Config, agentKeys []string) string {
+	services := []string{cfg.WatchdogServiceName()}
+	for _, key := range agentKeys {
+		services = append(services, cfg.ServiceName(key))
+		if cfg.Agents[key].WebTerminalPort != 0 {
+			services = append(services, cfg.TtydServiceName(key))
+		}
+		if cfg.UsesGitHubCoordination() {
+			services = append(services, cfg.GitHubWatchServiceName(key))
+		}
+	}
+	if anyEgressEnabled(cfg) {
+		services = append(services, cfg.NftablesServiceName())
+	}
+	if cfg.Vault.IsAgentVault() {
+		services = append(services, cfg.AgentVaultServiceName())
+	}
+	if listeners := cfg.SidecarListeners(); len(listeners) > 0 {
+		services = append(services, cfg.SidecarNftablesServiceName())
+		for _, listener := range listeners {
+			services = append(services, cfg.SidecarServiceName(listener.Server.Name, listener.AgentKey))
+		}
+	}
+
+	patterns := make([]string, 0, len(services))
+	for _, service := range services {
+		patterns = append(patterns, regexp.QuoteMeta(service))
+	}
+	return "(" + strings.Join(patterns, "|") + ")"
 }
 
 // GenerateService renders the watchdog oneshot systemd service.
