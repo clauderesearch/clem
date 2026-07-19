@@ -222,3 +222,94 @@ func TestValidateRepoName_RejectsUnsafe(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateAgentKey_AcceptsNormal(t *testing.T) {
+	for _, key := range []string{"lead", "worker", "eng", "agent-1"} {
+		if err := validateAgentKey(key); err != nil {
+			t.Errorf("validateAgentKey(%q): %v", key, err)
+		}
+	}
+}
+
+func TestValidateAgentKey_RejectsUnsafe(t *testing.T) {
+	for _, key := range []string{
+		`lead; touch /tmp/pwned`,
+		"$(id)",
+		"agent name",
+		"../etc",
+		"--remote",
+		"-h",
+		"Lead",
+		"my_agent",
+		strings.Repeat("a", 32),
+		"",
+	} {
+		if err := validateAgentKey(key); err == nil {
+			t.Errorf("validateAgentKey(%q) expected error", key)
+		}
+	}
+}
+
+func TestLogin_ForwardsAgentsToRemoteCommand(t *testing.T) {
+	chdirTempGitRepo(t, "git@github.com:org/clem.git")
+	old := remoteSSHT
+	defer func() { remoteSSHT = old }()
+
+	var gotHost, gotCmd string
+	remoteSSHT = func(host, cmd string) error {
+		gotHost = host
+		gotCmd = cmd
+		return nil
+	}
+
+	if err := Login("myhost", []string{"lead", "worker"}); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if gotHost != "myhost" {
+		t.Errorf("SSH host = %q, want myhost", gotHost)
+	}
+	if !strings.Contains(gotCmd, "clem login -- lead worker") {
+		t.Errorf("command %q does not include option-terminated agent args", gotCmd)
+	}
+}
+
+func TestLogin_NoAgents_RunsAllLogin(t *testing.T) {
+	chdirTempGitRepo(t, "git@github.com:org/clem.git")
+	old := remoteSSHT
+	defer func() { remoteSSHT = old }()
+
+	var gotCmd string
+	remoteSSHT = func(host, cmd string) error {
+		gotCmd = cmd
+		return nil
+	}
+
+	if err := Login("myhost", nil); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if !strings.HasSuffix(gotCmd, "clem login") {
+		t.Errorf("command %q should end with bare clem login", gotCmd)
+	}
+}
+
+func TestLogin_InvalidAgentKeyRejected(t *testing.T) {
+	chdirTempGitRepo(t, "git@github.com:org/clem.git")
+	old := remoteSSHT
+	defer func() { remoteSSHT = old }()
+	called := false
+	remoteSSHT = func(host, cmd string) error {
+		called = true
+		return nil
+	}
+
+	err := Login("myhost", []string{"--remote"})
+	if err == nil {
+		t.Fatal("expected error for dash-prefixed agent key")
+	}
+	if !strings.Contains(err.Error(), "must match") {
+		t.Errorf("error %q should explain the valid agent-key grammar", err)
+	}
+	if called {
+		t.Fatal("invalid agent key must be rejected before SSH")
+	}
+}
