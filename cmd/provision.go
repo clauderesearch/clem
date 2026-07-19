@@ -21,8 +21,9 @@ import (
 )
 
 var (
-	provisionRemote  string
-	provisionGHToken string
+	provisionRemote      string
+	provisionGHToken     string
+	provisionRotateCreds bool
 )
 
 var provisionCmd = &cobra.Command{
@@ -35,6 +36,7 @@ func init() {
 	rootCmd.AddCommand(provisionCmd)
 	provisionCmd.Flags().StringVar(&provisionRemote, "remote", "", "provision on a remote host via SSH (e.g. root@1.2.3.4)")
 	provisionCmd.Flags().StringVar(&provisionGHToken, "gh-token", "", "GitHub token for cloning the repo on the remote (falls back to GH_TOKEN env)")
+	provisionCmd.Flags().BoolVar(&provisionRotateCreds, "rotate-credentials", false, "force-rotate brokered agent-vault tokens even if the current ones still work (restarts running brokered agents)")
 }
 
 // decryptForAgent is the vault decryption entry point used by provisioning.
@@ -75,8 +77,10 @@ func runProvision(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Egress containment (pipelock proxy + nftables UID firewall), host-level.
-	// Runs after the agent loop so all agent OS users exist for UID resolution.
+	// Egress containment (nftables UID firewall pinning agents to agent-vault's
+	// MITM), host-level. Runs after the agent loop so all agent OS users exist
+	// for UID resolution (the agent-vault allowlist + deny policy are applied
+	// per-agent-vault inside the loop).
 	if err := provisionEgress(); err != nil {
 		return err
 	}
@@ -96,7 +100,7 @@ func runProvision(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf("\nProvisioning complete. Run 'clem login' then 'clem up'.\n")
+	fmt.Printf("\nProvisioning complete. Run 'clem login' then 'clem start'.\n")
 	return nil
 }
 
@@ -112,6 +116,19 @@ func provisionAgent(agentKey string, ac config.AgentConfig) error {
 	if err := agent.EnsureUser(osUser); err != nil {
 		return fmt.Errorf("agent %s: %w", agentKey, err)
 	}
+	// Codex provisioning and runtime updates share the exact same generated,
+	// testable staged installer. Write it before InstallRuntime invokes it.
+	if ac.RuntimeKind() == "codex" {
+		binDir := filepath.Join(homeDir, ".local", "bin")
+		if err := agent.EnsureOwnedDir(binDir, osUser); err != nil {
+			return fmt.Errorf("ensuring %s: %w", binDir, err)
+		}
+		updaterPath := filepath.Join(binDir, "clem-codex-update")
+		if err := os.WriteFile(updaterPath, []byte(runner.GenerateCodexUpdater()), 0755); err != nil {
+			return fmt.Errorf("writing codex updater for %s: %w", agentKey, err)
+		}
+		chownDir(updaterPath, osUser)
+	}
 
 	// 1a. Install the agent's runtime (claude-code or opencode) into the
 	// user's home so self-update works and the runner always invokes a
@@ -122,8 +139,17 @@ func provisionAgent(agentKey string, ac config.AgentConfig) error {
 		return fmt.Errorf("installing %s for %s: %w", runtimeKind, osUser, err)
 	}
 
+	// 1b. Optional headroom context-compression proxy. Non-fatal: the runner
+	// falls back to a direct claude launch when the binary is missing.
+	if ac.Headroom {
+		fmt.Printf("  installing headroom for %s\n", osUser)
+		if err := agent.InstallHeadroom(osUser); err != nil {
+			fmt.Printf("  WARNING: %v (agent will run without headroom)\n", err)
+		}
+	}
+
 	// 2. Decrypt and write .env (merged with provider env vars)
-	secrets, ghToken, err := writeAgentEnv(agentKey, ac, osUser, homeDir)
+	secrets, ghToken, envChanged, err := writeAgentEnv(agentKey, ac, osUser, homeDir)
 	if err != nil {
 		return err
 	}
@@ -133,6 +159,15 @@ func provisionAgent(agentKey string, ac config.AgentConfig) error {
 		return fmt.Errorf("writing settings for %s: %w", agentKey, err)
 	}
 	fmt.Printf("  wrote %s/.claude/settings.json\n", homeDir)
+
+	// 3ac. Optional rtk output filter. Must follow step 3: WriteSettings
+	// rewrites settings.json wholesale and would drop the hook `rtk init`
+	// writes there. Non-fatal like headroom.
+	if ac.RTK {
+		if err := agent.InstallRTK(osUser); err != nil {
+			fmt.Printf("  WARNING: %v (agent will run without rtk)\n", err)
+		}
+	}
 
 	// 3aa. Install extensions (marketplaces, plugins, skills, MCP servers).
 	// caveman: true is handled as a shorthand inside InstallExtensions.
@@ -264,19 +299,44 @@ func provisionAgent(agentKey string, ac config.AgentConfig) error {
 		}
 		fmt.Printf("  installed %s (port %d)\n", ttydSvcName, ac.WebTerminalPort)
 	}
+
+	// 7. A running agent keeps its process env frozen from the .env it was
+	// started with: a rotated broker token 407s on every API call, and new or
+	// changed secrets never arrive. When provision changed .env, try-restart
+	// running services so they pick it up — try-restart is a no-op for
+	// operator-stopped units, so those stay stopped. Unchanged .env (the
+	// common re-provision) restarts nothing.
+	if envChanged {
+		restart := []string{cfg.ServiceName(agentKey)}
+		if ac.WebTerminalPort > 0 {
+			restart = append(restart, cfg.TtydServiceName(agentKey))
+		}
+		for _, svc := range restart {
+			if err := agent.TryRestartService(svc); err != nil {
+				// .env on disk is already correct; a manual restart recovers.
+				fmt.Printf("  warning: restarting %s after .env change: %v\n", svc, err)
+				continue
+			}
+			fmt.Printf("  restarted %s if running (.env changed)\n", svc)
+		}
+	}
 	return nil
 }
 
 // writeAgentEnv decrypts the agent's vaults and writes /home/<user>/.env —
-// plain values, or placeholders plus a freshly-minted inject-only token when
-// the agent is brokered. Returns the qualified secrets map (for extensions'
-// vault refs) and the agent's GH_TOKEN (for signing-key registration). A
-// decrypt failure is a warning, not an error: provider-only env still lets an
-// agent run without a vault.
-func writeAgentEnv(agentKey string, ac config.AgentConfig, osUser, homeDir string) (map[string]string, string, error) {
+// plain values, or placeholders plus an inject-only agent-vault token when
+// the agent is brokered. The existing token is reused when it still
+// authenticates (verified through the proxy), so a no-op re-provision leaves
+// .env byte-identical; rotation happens only when the token is missing, dead,
+// or --rotate-credentials is set. Returns the qualified secrets map (for
+// extensions' vault refs), the agent's GH_TOKEN (for signing-key
+// registration), and whether .env content changed (caller restarts running
+// services only then). A decrypt failure is a warning, not an error:
+// provider-only env still lets an agent run without a vault.
+func writeAgentEnv(agentKey string, ac config.AgentConfig, osUser, homeDir string) (map[string]string, string, bool, error) {
 	providerEnv, pErr := ac.ProviderEnv()
 	if pErr != nil {
-		return nil, "", fmt.Errorf("agent %s: %w", agentKey, pErr)
+		return nil, "", false, fmt.Errorf("agent %s: %w", agentKey, pErr)
 	}
 	if ac.Provider != "" && ac.Provider != "anthropic" {
 		fmt.Printf("  provider: %s\n", ac.Provider)
@@ -287,14 +347,15 @@ func writeAgentEnv(agentKey string, ac config.AgentConfig, osUser, homeDir strin
 		fmt.Printf("  warning: could not decrypt secrets for %s: %v\n", agentKey, err)
 		if len(providerEnv) > 0 {
 			// still write provider env so agents can run without vault
-			if err := agent.WriteEnvFile(osUser, homeDir, providerEnv); err != nil {
-				return nil, "", fmt.Errorf("writing .env for %s: %w", agentKey, err)
+			changed, err := agent.WriteEnvFile(osUser, homeDir, providerEnv)
+			if err != nil {
+				return nil, "", false, fmt.Errorf("writing .env for %s: %w", agentKey, err)
 			}
 			fmt.Printf("  wrote %s/.env (provider only, no vault)\n", homeDir)
-		} else {
-			fmt.Println("  skipping .env — run clem vault init and set secrets first")
+			return nil, "", changed, nil
 		}
-		return nil, "", nil
+		fmt.Println("  skipping .env — run clem vault init and set secrets first")
+		return nil, "", false, nil
 	}
 
 	flatSecrets := vault.FlatSecrets(secrets)
@@ -304,7 +365,7 @@ func writeAgentEnv(agentKey string, ac config.AgentConfig, osUser, homeDir strin
 			msg := fmt.Sprintf("agent %s: %d granted key(s) neither brokered nor revealed: %s\n  (add to brokered_secrets, reveal_secrets, or set vault.exposure_policy: off)",
 				agentKey, len(violations), strings.Join(violations, ", "))
 			if policy == "strict" {
-				return nil, "", fmt.Errorf("%s", msg)
+				return nil, "", false, fmt.Errorf("%s", msg)
 			}
 			fmt.Fprintf(os.Stderr, "  warning: %s\n", msg)
 		}
@@ -321,17 +382,61 @@ func writeAgentEnv(agentKey string, ac config.AgentConfig, osUser, homeDir strin
 		addr := cfg.Vault.AddrOrDefault()
 		consolidated, brokeredKV, svcs, bErr := brokeredSeedInputs(osUser, ac, cfg.Vault.Services, flatSecrets)
 		if bErr != nil {
-			return nil, "", fmt.Errorf("agent %s: %w", agentKey, bErr)
+			return nil, "", false, fmt.Errorf("agent %s: %w", agentKey, bErr)
 		}
 		if err := vault.SeedVault(addr, consolidated, brokeredKV); err != nil {
-			return nil, "", fmt.Errorf("agent %s: seeding consolidated vault: %w", agentKey, err)
+			return nil, "", false, fmt.Errorf("agent %s: seeding consolidated vault: %w", agentKey, err)
 		}
+		// MUST run before the ApplyPassthroughServices/deny-policy block below:
+		// agent-vault breaks ties between equally-scoring host matches
+		// first-declared-wins (verified against v0.22.0), so a host present in
+		// both the credential-injecting services list and the passthrough
+		// allowlist must have its real service rule land first. Swapping this
+		// order would silently disable credential injection for any host on
+		// both lists — the passthrough (no-credential) rule would win instead.
 		if err := vault.ApplyServices(addr, consolidated, svcs); err != nil {
-			return nil, "", fmt.Errorf("agent %s: applying service rules: %w", agentKey, err)
+			return nil, "", false, fmt.Errorf("agent %s: applying service rules: %w", agentKey, err)
 		}
-		token, terr := vault.EnsureAgentIdentity(addr, osUser, []string{consolidated})
-		if terr != nil {
-			return nil, "", fmt.Errorf("agent %s: minting agent-vault token: %w", agentKey, terr)
+		// Egress containment: allowlist the configured domains as agent-vault
+		// passthrough services, reconcile away any stale allowlist entries for
+		// domains no longer configured, and flip the vault to deny every
+		// unmatched host. The deny policy is what makes containment real —
+		// without it agent-vault forwards unmatched hosts — so fail
+		// provisioning loudly if any of these error.
+		if cfg.EgressEnabledFor(agentKey) {
+			domains := cfg.EgressDomainsOrDefault()
+			if err := vault.ApplyPassthroughServices(addr, consolidated, domains); err != nil {
+				return nil, "", false, fmt.Errorf("agent %s: allowlisting egress domains: %w", agentKey, err)
+			}
+			if err := vault.ReconcilePassthroughServices(addr, consolidated, domains); err != nil {
+				return nil, "", false, fmt.Errorf("agent %s: reconciling egress allowlist: %w", agentKey, err)
+			}
+			if err := vault.SetUnmatchedHostPolicy(addr, consolidated, "deny"); err != nil {
+				return nil, "", false, fmt.Errorf("agent %s: setting egress deny policy: %w", agentKey, err)
+			}
+			fmt.Printf("  egress contained: %d allowlisted domain(s), unmatched hosts denied\n", len(domains))
+		} else {
+			// Sticky-deny guard: an agent that had egress containment enabled
+			// in a previous provision, then had it turned off in clem.yaml,
+			// must not be left with a stale "deny" unmatched-host policy — that
+			// would silently break all its egress with no allowlist to explain
+			// why. Explicitly reset to agent-vault's permissive default.
+			if err := vault.SetUnmatchedHostPolicy(addr, consolidated, "passthrough"); err != nil {
+				return nil, "", false, fmt.Errorf("agent %s: resetting unmatched-host policy: %w", agentKey, err)
+			}
+		}
+		// Reuse the agent's current token when it still authenticates: rotation
+		// invalidates the old token, which forces a restart of the running
+		// agent. Rotate only when the token is missing, dead (self-heals the
+		// stale-credential 407 state), or explicitly requested.
+		token := agent.ReadEnvValue(homeDir, "AGENT_VAULT_TOKEN")
+		if token != "" && !provisionRotateCreds && agent.ProxyTokenValid(cfg.Vault, token, consolidated) {
+			fmt.Printf("  reusing agent-vault token for %s (still valid)\n", osUser)
+		} else {
+			token, err = vault.EnsureAgentIdentity(addr, osUser, []string{consolidated})
+			if err != nil {
+				return nil, "", false, fmt.Errorf("agent %s: minting agent-vault token: %w", agentKey, err)
+			}
 		}
 		merged = agent.BrokeredEnv(cfg.Vault, ac, token, consolidated, flatSecrets)
 		for k, v := range providerEnv {
@@ -348,8 +453,9 @@ func writeAgentEnv(agentKey string, ac config.AgentConfig, osUser, homeDir strin
 		}
 		fmt.Printf("  wrote %s/.env (%d secrets + %d provider)\n", homeDir, len(secrets), len(providerEnv))
 	}
-	if err := agent.WriteEnvFile(osUser, homeDir, merged); err != nil {
-		return nil, "", fmt.Errorf("writing .env for %s: %w", agentKey, err)
+	envChanged, err := agent.WriteEnvFile(osUser, homeDir, merged)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("writing .env for %s: %w", agentKey, err)
 	}
 
 	// If wrangler credentials are present, write the wrangler config file
@@ -363,7 +469,7 @@ func writeAgentEnv(agentKey string, ac config.AgentConfig, osUser, homeDir strin
 	if ghToken != "" && ac.GitEmail == "" {
 		fmt.Printf("  warning: agent %s has GH_TOKEN but no git_email in clem.yaml — commits may leak operator identity\n", agentKey)
 	}
-	return secrets, ghToken, nil
+	return secrets, ghToken, envChanged, nil
 }
 
 // exposureViolations returns the sorted set of keys present in flat that are
@@ -499,8 +605,17 @@ func provisionAgentVaultHost() error {
 	if ownerEmail == "" || ownerPassword == "" {
 		return fmt.Errorf("agent-vault: set the owner account: clem vault set clem-vault AGENT_VAULT_OWNER_EMAIL=... AGENT_VAULT_OWNER_PASSWORD=...")
 	}
+	envFile := "AGENT_VAULT_MASTER_PASSWORD=" + master + "\n"
+	if anyEgressEnabled() {
+		// agent-vault's proxy_request log line (matched_service, host, err, status)
+		// logs at slog Debug level by default, so the watchdog's deny-event check
+		// (check_deny_events, journalctl-based) sees nothing unless the unit's log
+		// level is raised. Only worth the extra log volume when some agent actually
+		// has egress containment on.
+		envFile += "AGENT_VAULT_LOG_LEVEL=debug\n"
+	}
 	if err := os.WriteFile(proxy.AgentVaultEnvFile,
-		[]byte("AGENT_VAULT_MASTER_PASSWORD="+master+"\n"), 0600); err != nil {
+		[]byte(envFile), 0600); err != nil {
 		return fmt.Errorf("agent-vault: writing master env file: %w", err)
 	}
 
@@ -510,12 +625,30 @@ func provisionAgentVaultHost() error {
 	if err := agent.StartService(cfg.AgentVaultServiceName()); err != nil {
 		return fmt.Errorf("agent-vault: starting service: %w", err)
 	}
+	// enable --now is deliberately idempotent and does not re-exec an already
+	// running unit. Re-provision may have replaced the pinned binary or changed
+	// its listener contract, so force one restart before health/API operations.
+	// This is especially important for the v0.22 -> v0.25 migration: the proxy
+	// hop changed from TLS to plain HTTP and an old process rejects every client.
+	if err := agent.RestartService(cfg.AgentVaultServiceName()); err != nil {
+		return fmt.Errorf("agent-vault: restarting service: %w", err)
+	}
 	addr := cfg.Vault.AddrOrDefault()
 	if err := waitHealthy(addr, 30); err != nil {
 		return fmt.Errorf("agent-vault: %w", err)
 	}
 	if err := vault.EnsureOwner(addr, ownerEmail, ownerPassword); err != nil {
 		return fmt.Errorf("agent-vault: owner auth: %w", err)
+	}
+	// The vault-settings PATCH (unmatched_host_policy) has no CLI in v0.22.0 —
+	// obtain an owner API Bearer now so the per-agent loop can call it. Needed
+	// whenever any agent is brokered, not just when egress is contained: a
+	// brokered agent with containment OFF still gets an explicit policy reset
+	// to "passthrough" (the sticky-deny guard), which is the same PATCH.
+	if anyVaultBrokerEnabled() {
+		if err := vault.LoginOwner(addr, ownerEmail, ownerPassword); err != nil {
+			return fmt.Errorf("agent-vault: owner API login (needed for unmatched-host policy): %w", err)
+		}
 	}
 	if err := vault.FetchCA(addr, cfg.Vault.CACertPathOrDefault()); err != nil {
 		return fmt.Errorf("agent-vault: fetching CA: %w", err)
@@ -560,47 +693,44 @@ func waitHealthy(addr string, attempts int) error {
 	return fmt.Errorf("agent-vault did not become healthy at %s after %ds", addr, attempts)
 }
 
-// provisionEgress installs the host-level egress containment stack — the
-// pipelock forward proxy and the per-agent nftables UID firewall — when any
-// agent has egress containment enabled. No-op otherwise. Must run after agent
-// OS users exist, since the firewall ruleset is keyed on their UIDs.
-func provisionEgress() error {
-	anyEgress := false
+// anyEgressEnabled reports whether at least one agent has egress containment on.
+func anyEgressEnabled() bool {
 	for key := range cfg.Agents {
 		if cfg.EgressEnabledFor(key) {
-			anyEgress = true
-			break
+			return true
 		}
 	}
-	if !anyEgress {
+	return false
+}
+
+// anyVaultBrokerEnabled reports whether at least one agent has agent-vault
+// credential brokering on (config validation guarantees this implies
+// cfg.Vault.IsAgentVault()).
+func anyVaultBrokerEnabled() bool {
+	for _, ac := range cfg.Agents {
+		if ac.VaultBroker {
+			return true
+		}
+	}
+	return false
+}
+
+// provisionEgress installs the per-agent nftables UID firewall that pins every
+// egress-contained agent's outbound traffic to agent-vault's MITM port. The
+// containment proxy itself is agent-vault (stood up by provisionAgentVaultHost);
+// the domain allowlist + deny policy are applied per-agent-vault during the
+// agent loop. No-op unless an agent has egress containment enabled. Must run
+// after agent OS users exist, since the firewall ruleset is keyed on their UIDs.
+func provisionEgress() error {
+	if !anyEgressEnabled() {
 		return nil
 	}
 
 	fmt.Printf("\n[egress]\n")
-	proxyUser := cfg.Egress.ProxyUserOrDefault()
-	if err := agent.EnsureSystemUser(proxyUser); err != nil {
-		return fmt.Errorf("egress: %w", err)
-	}
-	if err := agent.InstallPipelock(); err != nil {
-		return fmt.Errorf("egress: %w", err)
-	}
-
-	// /etc/clem holds the generated proxy config + firewall ruleset (root-owned,
-	// no secrets). /var/log/clem holds the signed audit log, written by the
-	// proxy user.
+	// /etc/clem holds the generated firewall ruleset (root-owned, no secrets).
 	if err := os.MkdirAll("/etc/clem", 0755); err != nil {
 		return fmt.Errorf("egress: creating /etc/clem: %w", err)
 	}
-	if err := os.MkdirAll(proxy.AuditLogPath, 0750); err != nil {
-		return fmt.Errorf("egress: creating %s: %w", proxy.AuditLogPath, err)
-	}
-	agent.ChownPath(proxy.AuditLogPath, proxyUser)
-
-	cfgPath := proxy.PipelockConfigPath(cfg.Project)
-	if err := os.WriteFile(cfgPath, []byte(proxy.GeneratePipelockConfig(cfg)), 0644); err != nil {
-		return fmt.Errorf("egress: writing %s: %w", cfgPath, err)
-	}
-	fmt.Printf("  wrote %s\n", cfgPath)
 
 	nft, err := proxy.GenerateNftables(cfg)
 	if err != nil {
@@ -612,8 +742,6 @@ func provisionEgress() error {
 	}
 	fmt.Printf("  wrote %s\n", nftPath)
 
-	// Firewall first (so the proxy comes up behind a closed boundary), then the
-	// proxy. The agent units order After= both via runner.proxyUnitDeps.
 	if err := agent.InstallServiceByName(cfg.NftablesServiceName(), proxy.GenerateNftablesService(cfg)); err != nil {
 		return fmt.Errorf("egress: installing firewall service: %w", err)
 	}
@@ -621,14 +749,6 @@ func provisionEgress() error {
 		return fmt.Errorf("egress: starting firewall: %w", err)
 	}
 	fmt.Printf("  installed + started %s\n", cfg.NftablesServiceName())
-
-	if err := agent.InstallServiceByName(cfg.PipelockServiceName(), proxy.GeneratePipelockService(cfg)); err != nil {
-		return fmt.Errorf("egress: installing pipelock service: %w", err)
-	}
-	if err := agent.StartService(cfg.PipelockServiceName()); err != nil {
-		return fmt.Errorf("egress: starting pipelock: %w", err)
-	}
-	fmt.Printf("  installed + started %s (port %d)\n", cfg.PipelockServiceName(), cfg.Egress.ProxyPortOrDefault())
 	return nil
 }
 

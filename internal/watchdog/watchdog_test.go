@@ -1,6 +1,7 @@
 package watchdog
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
@@ -51,6 +52,38 @@ func TestGenerateScript_PostRestartRecheckSuppressesAlert(t *testing.T) {
 	inc := strings.Index(s, `fails=$(( $(cat "$fail_count_file"`)
 	if preCheck == -1 || inc == -1 || inc < preCheck {
 		t.Errorf("fail-count increment must follow post_state check (preCheck=%d inc=%d)", preCheck, inc)
+	}
+}
+
+func TestGenerateScript_SkipsDisabledUnits(t *testing.T) {
+	s := GenerateScript(baseCfg())
+	// 'systemctl disable --now' is the operator's permanent-stop escape hatch;
+	// the watchdog must not resurrect a deliberately disabled (or masked)
+	// agent — retrying a masked unit only fires spurious failure alerts.
+	guard := `disabled|masked) return ;;`
+	if !strings.Contains(s, guard) {
+		t.Errorf("generated script missing disabled-unit guard %q\n---\n%s", guard, s)
+	}
+	// The guard must run before any restart attempt.
+	guardIdx := strings.Index(s, guard)
+	restartIdx := strings.Index(s, `systemctl restart "$service"`)
+	if guardIdx == -1 || restartIdx == -1 || guardIdx > restartIdx {
+		t.Errorf("disabled-unit guard must precede restart (guard=%d restart=%d)", guardIdx, restartIdx)
+	}
+}
+
+func TestGenerateScript_UnsetsProxyEnvBeforeAlertCurl(t *testing.T) {
+	s := GenerateScript(baseCfg())
+	// The sourced agent .env may export egress-proxy/CA overrides; with them
+	// set, direct backend curls fail TLS validation silently. The unset must
+	// come after the env source and before send_alert's curl.
+	unset := "unset HTTPS_PROXY"
+	unsetIdx := strings.Index(s, unset)
+	if unsetIdx == -1 {
+		t.Fatalf("generated script missing proxy-env unset\n---\n%s", s)
+	}
+	if curlIdx := strings.Index(s, "curl -s -X POST"); curlIdx != -1 && unsetIdx > curlIdx {
+		t.Errorf("proxy-env unset must precede alert curl (unset=%d curl=%d)", unsetIdx, curlIdx)
 	}
 }
 
@@ -151,7 +184,7 @@ func TestGenerateScript_OOMCheckPresent(t *testing.T) {
 		`check_oom()`,
 		`journalctl --since "$since" --no-pager`,
 		`killed by the OOM killer`,
-		`clem-[a-zA-Z0-9_-]+\.service`,
+		`(clem-watchdog-test\.service|clem-test-lead\.service)`,
 		`OOM-kill detected`,
 		`free -h`,
 	} {
@@ -167,6 +200,61 @@ func TestGenerateScript_OOMCheckPresent(t *testing.T) {
 	if defIdx == -1 || callIdx == -1 || callIdx <= defIdx {
 		t.Errorf("check_oom must be defined and then invoked (def=%d call=%d)", defIdx, callIdx)
 	}
+}
+
+// TestGenerateScript_OOMCheckScopedToProject regression-tests #148: the OOM
+// grep must match only this project's services, not every clem-* service
+// on the host (which double-reports OOM kills across co-located projects).
+func TestGenerateScript_OOMCheckScopedToProject(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Project = "foo"
+	cfg.Agents["lead"] = config.AgentConfig{
+		Name: "Lead", Model: "claude-opus-4-7", Iteration: "1m", Prompt: "x", WebTerminalPort: 7681,
+	}
+	cfg.Coordination.Backend = "github"
+	cfg.Coordination.GithubRepo = "owner/repo"
+	cfg.Vault.Backend = "agent-vault"
+	cfg.MCPSidecars.Servers = []config.SidecarServer{{
+		Name: "search", Identity: "shared", Command: "/usr/bin/search-mcp",
+		Secrets: []string{"SEARCH_TOKEN"}, SecretsVault: "shared",
+	}}
+	agent := cfg.Agents["lead"]
+	agent.Sidecars = []string{"search"}
+	enabled := true
+	agent.Egress = &enabled
+	cfg.Agents["lead"] = agent
+
+	pattern := oomServicePattern(cfg, []string{"lead"})
+	re := regexp.MustCompile(`^(?:` + pattern + `)$`)
+	for _, service := range []string{
+		"clem-foo-lead.service",
+		"clem-watchdog-foo.service",
+		"clem-ttyd-foo-lead.service",
+		"clem-github-watch-foo-lead.service",
+		"clem-nftables-foo.service",
+		"clem-agent-vault-foo.service",
+		"clem-mcp-foo-search.service",
+		"clem-sidecar-nft-foo.service",
+	} {
+		if !re.MatchString(service) {
+			t.Errorf("OOM pattern %q must match this project's unit %q", pattern, service)
+		}
+	}
+	for _, service := range []string{
+		"clem-foo-bar-lead.service",
+		"clem-watchdog-foo-bar.service",
+		"clem-agent-vault-foo-bar.service",
+		"clem-unrelated.service",
+	} {
+		if re.MatchString(service) {
+			t.Errorf("OOM pattern %q must not match another project's unit %q", pattern, service)
+		}
+	}
+
+	s := GenerateScript(cfg)
+	if !strings.Contains(s, `grep -oE "`+pattern+`"`) {
+		t.Errorf("generated script must use exact project service pattern %q:\n%s", pattern, s)
+	}
 
 	// marker must be written after the journalctl scan to avoid silently
 	// dropping events on interruption between the two lines.
@@ -177,31 +265,17 @@ func TestGenerateScript_OOMCheckPresent(t *testing.T) {
 	}
 }
 
-func TestGenerateScript_EgressCheckPresentWhenEnabled(t *testing.T) {
+// Egress containment is now enforced by agent-vault + nftables and no longer
+// produces a clem-owned audit log, so the watchdog must not tail one.
+func TestGenerateScript_NoEgressAuditTailing(t *testing.T) {
 	cfg := baseCfg()
 	cfg.Egress.Enabled = true
 	s := GenerateScript(cfg)
-	for _, want := range []string{
-		"check_egress()",
-		"/var/log/clem/pipelock-test-audit.jsonl",
-		"blocked/DLP event(s)",
-	} {
-		if !strings.Contains(s, want) {
-			t.Errorf("expected %q in watchdog script:\n%s", want, s)
-		}
-	}
-	// check_egress must be defined before it is invoked.
-	defIdx := strings.Index(s, "check_egress()")
-	callIdx := strings.LastIndex(s, "check_egress")
-	if defIdx == -1 || callIdx <= defIdx {
-		t.Errorf("check_egress must be defined then invoked (def=%d call=%d)", defIdx, callIdx)
-	}
-}
-
-func TestGenerateScript_NoEgressCheckWhenDisabled(t *testing.T) {
-	s := GenerateScript(baseCfg())
 	if strings.Contains(s, "check_egress") {
-		t.Errorf("expected no check_egress when egress disabled:\n%s", s)
+		t.Errorf("watchdog must not tail an egress audit log that no longer exists:\n%s", s)
+	}
+	if strings.Contains(s, "pipelock") {
+		t.Errorf("watchdog must not reference pipelock:\n%s", s)
 	}
 }
 
@@ -229,6 +303,50 @@ func TestGenerateScript_AgentVaultHealthWhenBackendActive(t *testing.T) {
 func TestGenerateScript_NoAgentVaultCheckWhenEnvBackend(t *testing.T) {
 	if strings.Contains(GenerateScript(baseCfg()), "check_agent_vault") {
 		t.Error("no agent-vault check expected under default env backend")
+	}
+}
+
+func TestGenerateScript_DenyEventCheckWhenEgressEnabled(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Vault.Backend = "agent-vault"
+	cfg.Egress.Enabled = true
+	s := GenerateScript(cfg)
+	for _, want := range []string{
+		"check_deny_events()",
+		`journalctl -u "clem-agent-vault-test.service"`,
+		"msg=proxy_request",
+		"err=no_match",
+		"agent-vault denied unmatched-host requests",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("expected %q in watchdog script:\n%s", want, s)
+		}
+	}
+	defIdx := strings.Index(s, "check_deny_events()")
+	callIdx := strings.LastIndex(s, "check_deny_events")
+	if defIdx == -1 || callIdx <= defIdx {
+		t.Errorf("check_deny_events must be defined then invoked (def=%d call=%d)", defIdx, callIdx)
+	}
+}
+
+func TestGenerateScript_NoDenyEventCheckWhenEgressDisabled(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Vault.Backend = "agent-vault"
+	// Egress left disabled: no agent has containment on, so agent-vault isn't
+	// running with AGENT_VAULT_LOG_LEVEL=debug and there is nothing for this
+	// check to read.
+	s := GenerateScript(cfg)
+	if strings.Contains(s, "check_deny_events") {
+		t.Errorf("no deny-event check expected when no agent has egress enabled:\n%s", s)
+	}
+}
+
+func TestGenerateScript_NoDenyEventCheckWhenNoAgentVault(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Egress.Enabled = true
+	s := GenerateScript(cfg)
+	if strings.Contains(s, "check_deny_events") {
+		t.Errorf("no deny-event check expected without agent-vault backend:\n%s", s)
 	}
 }
 

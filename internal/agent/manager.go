@@ -110,9 +110,9 @@ func EnsureUser(username string) error {
 }
 
 // EnsureSystemUser creates a dedicated non-login system user (no home, nologin
-// shell) used to run a host service such as the pipelock egress proxy. Keeping
-// it distinct from the agent users is what lets the nftables UID firewall allow
-// the proxy to egress while rejecting every agent UID. Idempotent.
+// shell) used to run a host service such as the agent-vault credential proxy.
+// Keeping it distinct from the agent users is what lets the nftables UID
+// firewall allow the proxy to egress while rejecting every agent UID. Idempotent.
 func EnsureSystemUser(username string) error {
 	if _, err := sys.Run("id", username); err == nil {
 		fmt.Printf("  system user %s already exists\n", username)
@@ -132,76 +132,18 @@ func EnsureSystemUser(username string) error {
 	return nil
 }
 
-// PipelockVersion is the pinned pipelock release clem installs. Bump
-// deliberately; the binary is a security boundary (the egress firewall/DLP).
-const PipelockVersion = "v2.5.0"
-
-// InstallPipelock installs the pinned pipelock release to /usr/local/bin,
-// verifying the download against the release's checksums.txt. Idempotent:
-// skips when the pinned version is already present. We do NOT use the
-// `curl | sh` installer or `go install` (the latter needs Go 1.25+ and yields
-// a community-only binary) for a security-critical component.
-//
-// SUPPLY-CHAIN SCOPE: this verifies INTEGRITY (the tarball matches the
-// checksums.txt shipped in the same release) but not AUTHENTICITY against an
-// out-of-band trust root — an attacker who can replace the release asset can
-// replace checksums.txt too (TOFU). Hardening to a clem-pinned digest or a
-// cosign signature is a tracked follow-up.
-//
-// Asset naming follows the goreleaser default the project ships:
-// pipelock_<version-no-v>_linux_<arch>.tar.gz. Bump PipelockVersion to upgrade.
-func InstallPipelock() error {
-	// Accept either `pipelock --version` (flag) or `pipelock version`
-	// (subcommand) so the idempotency check doesn't force a re-download.
-	verCheck := "/usr/local/bin/pipelock --version 2>/dev/null || /usr/local/bin/pipelock version 2>/dev/null"
-	if out, err := sys.Run("bash", "-c", verCheck); err == nil &&
-		strings.Contains(string(out), strings.TrimPrefix(PipelockVersion, "v")) {
-		fmt.Printf("  pipelock %s already installed\n", PipelockVersion)
-		return nil
-	}
-
-	var arch string
-	switch runtime.GOARCH {
-	case "amd64":
-		arch = "amd64"
-	case "arm64":
-		arch = "arm64"
-	default:
-		return fmt.Errorf("unsupported arch %q for pipelock install", runtime.GOARCH)
-	}
-
-	ver := PipelockVersion
-	verNoV := strings.TrimPrefix(ver, "v")
-	// Download tarball + checksums, verify sha256, extract the binary. set -e so
-	// any failed step (download, checksum mismatch, extract) aborts non-zero.
-	// The explicit empty-line guard prevents `sha256sum -c` from succeeding on
-	// empty stdin when the asset name doesn't match a checksums.txt line.
-	script := fmt.Sprintf(`set -euo pipefail
-VER=%q; VNV=%q; ARCH=%q
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT; cd "$TMP"
-BASE="https://github.com/luckyPipewrench/pipelock/releases/download/${VER}"
-ASSET="pipelock_${VNV}_linux_${ARCH}.tar.gz"
-curl -fsSL -o "$ASSET" "${BASE}/${ASSET}"
-curl -fsSL -o checksums.txt "${BASE}/checksums.txt"
-LINE=$(grep " ${ASSET}\$" checksums.txt || true)
-[ -n "$LINE" ] || { echo "no checksum line for ${ASSET} in checksums.txt" >&2; exit 1; }
-printf '%%s\n' "$LINE" | sha256sum -c -
-tar -xzf "$ASSET" pipelock
-install -m 0755 pipelock /usr/local/bin/pipelock`, ver, verNoV, arch)
-
-	fmt.Printf("  installing pipelock %s (%s)\n", ver, arch)
-	if out, err := sys.Run("bash", "-c", script); err != nil {
-		return fmt.Errorf("installing pipelock %s: %w\n%s", ver, err, out)
-	}
-	return nil
-}
-
 // AgentVaultVersion is the pinned agent-vault release clem installs.
-const AgentVaultVersion = "v0.22.0"
+// v0.25.0 is the first release that streams MITM responses without the old
+// 100 MiB ceiling. The ceiling silently truncated Codex's platform tarball;
+// npm then reported success after installing only the JavaScript launcher.
+const AgentVaultVersion = "v0.25.0"
 
 // InstallAgentVault installs the pinned agent-vault release to /usr/local/bin,
-// verifying against the release checksums.txt (integrity; same TOFU caveat as
-// InstallPipelock — pin a digest/signature before production). Idempotent.
+// verifying against the release checksums.txt. This verifies INTEGRITY (the
+// tarball matches the checksums.txt shipped in the same release) but not
+// AUTHENTICITY against an out-of-band trust root — an attacker who can replace
+// the release asset can replace checksums.txt too (TOFU). Hardening to a
+// clem-pinned digest or a cosign signature is a tracked follow-up. Idempotent.
 func InstallAgentVault() error {
 	verCheck := "/usr/local/bin/agent-vault --version 2>/dev/null || /usr/local/bin/agent-vault version 2>/dev/null"
 	if out, err := sys.Run("bash", "-c", verCheck); err == nil &&
@@ -251,7 +193,7 @@ const MCPProxyVersion = "0.12.0"
 // system user can run it. Idempotent: skips when the pinned version is present.
 // pipx isolates the bridge's dependency tree from system Python — the same
 // rationale as the operator-installed Python MCP servers (see README). Same
-// PyPI TOFU caveat as InstallPipelock/InstallAgentVault applies.
+// PyPI TOFU caveat as InstallAgentVault applies.
 func InstallMCPProxy() error {
 	const bin = "/opt/pipx/bin/mcp-proxy" // keep in sync with proxy.MCPProxyBin
 	verCheck := bin + " --version 2>/dev/null"
@@ -306,9 +248,8 @@ func WriteSystemdEnvFile(path string, env map[string]string) error {
 // value, and the agent-vault connection + CA-trust env is added. The agent
 // holds only a scoped, inject-only token — not the upstream credentials.
 //
-// HTTPS_PROXY points at agent-vault (overriding any Phase-1 pipelock export,
-// since .env is sourced after that export). vaultName selects the proxy's
-// active vault context (the agent's first vault).
+// HTTPS_PROXY points at agent-vault. vaultName selects the proxy's active vault
+// context (the agent's first vault).
 //
 // INJECTION: emitting the placeholder is necessary but not sufficient —
 // agent-vault must also be told to swap it. That mapping is an agent-vault
@@ -333,18 +274,22 @@ func BrokeredEnv(av config.VaultBackend, ac config.AgentConfig, token, vaultName
 	// url.UserPassword percent-encodes token/vault so reserved chars (@ : / #)
 	// in a minted token can't corrupt the proxy URL.
 	proxyURL := (&url.URL{
-		Scheme: "https",
+		// agent-vault >= v0.23 exposes a plain HTTP CONNECT proxy on loopback.
+		// The tunneled upstream connection remains HTTPS and is intercepted
+		// with agent-vault's CA; only the local proxy hop is no longer TLS.
+		Scheme: "http",
 		User:   url.UserPassword(token, vaultName),
 		Host:   av.ProxyHostOrDefault(),
 	}).String()
-	// SECURITY NOTE: a brokered agent has egress containment disabled (the two are
-	// mutually exclusive — see config validation), so it can reach the agent-vault
-	// management API at AGENT_VAULT_ADDR directly. The inject-only guarantee
-	// therefore rests entirely on the minted token being instance-role no-access +
-	// vault-role proxy ONLY (enforced in vault.EnsureAgentIdentity): that token
-	// cannot read credentials or mutate vaults/services. Do not widen the token's
-	// role, and do not expose role config to operators. Hardening follow-up:
-	// firewall the management port off the agent UID even when brokering.
+	// SECURITY NOTE: an egress-contained brokered agent cannot reach the
+	// agent-vault management API — the nftables UID firewall allows the agent
+	// only agent-vault's MITM port, not its management port. A brokered agent
+	// WITHOUT egress containment can still reach the management API at
+	// AGENT_VAULT_ADDR directly, so the inject-only guarantee for that case rests
+	// entirely on the minted token being instance-role no-access + vault-role
+	// proxy ONLY (enforced in vault.EnsureAgentIdentity): that token cannot read
+	// credentials or mutate vaults/services. Do not widen the token's role, and
+	// do not expose role config to operators.
 	env["AGENT_VAULT_ADDR"] = av.AddrOrDefault()
 	env["AGENT_VAULT_TOKEN"] = token
 	env["AGENT_VAULT_VAULT"] = vaultName
@@ -358,25 +303,60 @@ func BrokeredEnv(av config.VaultBackend, ac config.AgentConfig, token, vaultName
 	env["REQUESTS_CA_BUNDLE"] = ca
 	env["CURL_CA_BUNDLE"] = ca
 	env["GIT_SSL_CAINFO"] = ca
-	// HTTPS_PROXY is an HTTPS (TLS) proxy, so git tunnels to it over TLS and must
-	// trust the agent-vault CA for the PROXY connection too — not just the
-	// upstream (GIT_SSL_CAINFO). git has no env var for http.proxySSLCAInfo, so
-	// inject it via GIT_CONFIG_*. Without this, EVERY git operation through the
-	// broker (push/pull/clone to any host) fails proxy certificate verification.
-	env["GIT_CONFIG_COUNT"] = "1"
-	env["GIT_CONFIG_KEY_0"] = "http.proxySSLCAInfo"
-	env["GIT_CONFIG_VALUE_0"] = ca
 	return env
+}
+
+// ReadEnvValue extracts a single key's value from <homeDir>/.env as written
+// by WriteEnvFile (export KEY='value', single-quote escaped). Returns "" if
+// the file or key is missing. Used to recover the agent's current agent-vault
+// token so re-provision can reuse it instead of rotating.
+func ReadEnvValue(homeDir, key string) string {
+	data, err := os.ReadFile(filepath.Join(homeDir, ".env"))
+	if err != nil {
+		return ""
+	}
+	prefix := "export " + key + "='"
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, prefix) && strings.HasSuffix(line, "'") && len(line) > len(prefix) {
+			return strings.ReplaceAll(line[len(prefix):len(line)-1], `'\''`, "'")
+		}
+	}
+	return ""
+}
+
+// ProxyTokenValid reports whether an agent-vault proxy token still
+// authenticates, by attempting one request through the broker proxy with it.
+// An invalid/rotated token gets 407 at CONNECT and curl exits non-zero. Any
+// failure (proxy down, timeout) counts as invalid — the caller then rotates,
+// which is the safe pre-existing behavior.
+func ProxyTokenValid(av config.VaultBackend, token, vaultName string) bool {
+	proxyURL := (&url.URL{
+		Scheme: "https",
+		User:   url.UserPassword(token, config.AgentVaultName(vaultName)),
+		Host:   av.ProxyHostOrDefault(),
+	}).String()
+	_, err := sys.Run("curl", "-sS", "-o", "/dev/null", "--max-time", "10",
+		"--proxy", proxyURL, "--proxy-cacert", av.CACertPathOrDefault(),
+		"https://api.anthropic.com/")
+	return err == nil
 }
 
 // WriteEnvFile writes decrypted secrets to <homeDir>/.env with mode 0600.
 // Also writes a global gitignore that blocks .env, .git-credentials, and
-// secrets.sops.yaml from accidental commits.
-func WriteEnvFile(username, homeDir string, secrets map[string]string) error {
+// secrets.sops.yaml from accidental commits. Keys are written sorted so the
+// file is byte-stable across provisions; the returned bool reports whether
+// the content actually changed (callers restart running agents only then).
+func WriteEnvFile(username, homeDir string, secrets map[string]string) (bool, error) {
 	envPath := filepath.Join(homeDir, ".env")
 
+	keys := make([]string, 0, len(secrets))
+	for k := range secrets {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	var sb strings.Builder
-	for k, v := range secrets {
+	for _, k := range keys {
+		v := secrets[k]
 		// Strip vault-name prefix ("vaultName.keyName" → "keyName") so the
 		// exported name is the bare secret key. Keys without a dot pass through.
 		envKey := k
@@ -389,12 +369,15 @@ func WriteEnvFile(username, homeDir string, secrets map[string]string) error {
 		sb.WriteString(fmt.Sprintf("export %s='%s'\n", envKey, escaped))
 	}
 
+	old, _ := os.ReadFile(envPath)
+	changed := string(old) != sb.String()
+
 	if err := os.WriteFile(envPath, []byte(sb.String()), 0600); err != nil {
-		return fmt.Errorf("writing .env for %s: %w", username, err)
+		return false, fmt.Errorf("writing .env for %s: %w", username, err)
 	}
 
 	if out, err := sys.Run("chown", fmt.Sprintf("%s:%s", username, username), envPath); err != nil {
-		return fmt.Errorf("chown .env for %s: %w\n%s", username, err, out)
+		return false, fmt.Errorf("chown .env for %s: %w\n%s", username, err, out)
 	}
 
 	// Defense: write a global gitignore that blocks secret-bearing files.
@@ -410,10 +393,10 @@ id_rsa
 *.key
 `
 	if err := os.WriteFile(globalIgnore, []byte(ignoreContent), 0644); err != nil {
-		return fmt.Errorf("writing gitignore_global: %w", err)
+		return false, fmt.Errorf("writing gitignore_global: %w", err)
 	}
 	if err := chownToUser(globalIgnore, username); err != nil {
-		return fmt.Errorf("chowning %s: %w", globalIgnore, err)
+		return false, fmt.Errorf("chowning %s: %w", globalIgnore, err)
 	}
 
 	// Write/update ~/.gitconfig directly to avoid sudo subshell quoting issues
@@ -422,14 +405,14 @@ id_rsa
 	if !strings.Contains(string(existing), "excludesfile") {
 		appended := string(existing) + fmt.Sprintf("\n[core]\n\texcludesfile = %s\n", globalIgnore)
 		if err := os.WriteFile(gitConfigPath, []byte(appended), 0644); err != nil {
-			return fmt.Errorf("writing %s: %w", gitConfigPath, err)
+			return false, fmt.Errorf("writing %s: %w", gitConfigPath, err)
 		}
 		if err := chownToUser(gitConfigPath, username); err != nil {
-			return fmt.Errorf("chowning %s: %w", gitConfigPath, err)
+			return false, fmt.Errorf("chowning %s: %w", gitConfigPath, err)
 		}
 	}
 
-	return nil
+	return changed, nil
 }
 
 // chownToUser sets owner/group on path to username:username. Fatal for the
@@ -953,9 +936,12 @@ func InstallWatchdogTimer(cfg *config.Config, serviceContent, timerContent strin
 
 // StartService starts a systemd service.
 func StartService(serviceName string) error {
-	out, err := sys.Run("systemctl", "start", serviceName)
+	// enable --now rather than start: units disabled by 'clem stop'
+	// must come back enabled, or the watchdog (which skips disabled units)
+	// would never recover them after a crash.
+	out, err := sys.Run("systemctl", "enable", "--now", serviceName)
 	if err != nil {
-		return fmt.Errorf("systemctl start %s: %w\n%s", serviceName, err, out)
+		return fmt.Errorf("systemctl enable --now %s: %w\n%s", serviceName, err, out)
 	}
 	return nil
 }
@@ -972,11 +958,33 @@ func RestartService(serviceName string) error {
 	return nil
 }
 
+// TryRestartService restarts a systemd service only if it is currently
+// running; a stopped unit stays stopped (systemctl try-restart is a no-op
+// then). Used after re-provision rotates credentials a running agent holds
+// in its frozen process env — an operator-stopped agent must not be revived.
+func TryRestartService(serviceName string) error {
+	out, err := sys.Run("systemctl", "try-restart", serviceName)
+	if err != nil {
+		return fmt.Errorf("systemctl try-restart %s: %w\n%s", serviceName, err, out)
+	}
+	return nil
+}
+
 // StopService stops a systemd service.
 func StopService(serviceName string) error {
 	out, err := sys.Run("systemctl", "stop", serviceName)
 	if err != nil {
 		return fmt.Errorf("systemctl stop %s: %w\n%s", serviceName, err, out)
+	}
+	return nil
+}
+
+// DisableNowService stops a systemd unit and disables it, so the watchdog
+// (which skips disabled units) and reboots leave it stopped.
+func DisableNowService(serviceName string) error {
+	out, err := sys.Run("systemctl", "disable", "--now", serviceName)
+	if err != nil {
+		return fmt.Errorf("systemctl disable --now %s: %w\n%s", serviceName, err, out)
 	}
 	return nil
 }
@@ -1169,16 +1177,10 @@ func InstallRuntime(username, kind string) error {
 	}
 }
 
-// InstallCodex installs OpenAI's codex CLI for the given user via npm. Codex is
-// distributed on npm (no curl|bash installer like claude/opencode), so this
-// requires Node.js/npm to be present for the agent user. It uses a per-user
-// global prefix so the binary is owned by the agent (self-update works) and
-// lands at the stable path the runner invokes: ~/.npm-global/bin/codex.
+// InstallCodex invokes Clem's staged updater, which must already have been
+// written by provisioning. It succeeds only with a validated live release.
 func InstallCodex(username string) error {
-	script := "set -e; " +
-		"command -v npm >/dev/null 2>&1 || { echo 'npm not found: install Node.js/npm for this user before provisioning a codex agent' >&2; exit 1; }; " +
-		"npm config set prefix \"$HOME/.npm-global\"; " +
-		"npm install -g @openai/codex@latest"
+	script := `"$HOME/.local/bin/clem-codex-update" require`
 	cmd := exec.Command("sudo", "-iu", username, "bash", "-c", script)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1232,6 +1234,104 @@ func InstallClaude(username string) error {
 	}
 	if info.Mode()&0111 == 0 {
 		return fmt.Errorf("claude at %s is not executable", claudePath)
+	}
+	return nil
+}
+
+// InstallHeadroom installs the Headroom context-compression proxy (PyPI
+// package headroom-ai) as the given user, landing at ~/.local/bin/headroom.
+// The [proxy] extra is required: `headroom wrap` starts a FastAPI-based proxy
+// and dies at startup ("Proxy dependencies not installed" / "No module named
+// 'fastapi'") if the extra is absent, so we always install "headroom-ai[proxy]".
+// Portable across hosts: prefers pipx when available, otherwise falls back to a
+// pip --user install (adding --break-system-packages on PEP 668
+// externally-managed environments like Ubuntu 24.04).
+//
+// The pipx path uses `install --force` unconditionally: a plain `pipx install`
+// refuses to touch an existing venv and `pipx upgrade` never adds missing
+// extras, so a host that already has the bare package would stay broken. The
+// forced reinstall is idempotent and costs only a few seconds per provision.
+//
+// The runner falls back to a direct claude launch when the binary is missing,
+// so callers may treat a failure here as a warning rather than aborting the
+// provision.
+func InstallHeadroom(username string) error {
+	cmd := exec.Command("sudo", "-iu", username, "bash", "-c",
+		"if command -v pipx >/dev/null; then "+
+			"pipx install --force \"headroom-ai[proxy]\"; "+
+			"else "+
+			"python3 -m pip install --user --upgrade \"headroom-ai[proxy]\" 2>/dev/null || "+
+			"python3 -m pip install --user --upgrade --break-system-packages \"headroom-ai[proxy]\"; "+
+			"fi")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("installing headroom for %s: %w\n%s", username, err, out)
+	}
+	binPath := fmt.Sprintf("/home/%s/.local/bin/headroom", username)
+	info, err := os.Stat(binPath)
+	if err != nil {
+		return fmt.Errorf("headroom not found at %s after install: %w", binPath, err)
+	}
+	if info.Mode()&0111 == 0 {
+		return fmt.Errorf("headroom at %s is not executable", binPath)
+	}
+	return nil
+}
+
+// RTKVersion is the pinned rtk (github.com/rtk-ai/rtk) release clem installs.
+// Bump the version and the digests in rtkSHA256 together, from the release's
+// checksums.txt.
+const RTKVersion = "0.43.0"
+
+// rtkAsset and rtkSHA256 map GOARCH to the release asset and its digest.
+// Unlike InstallAgentVault's checksums.txt flow, the digests are clem-pinned
+// (in-source), so a replaced release asset fails verification instead of
+// installing.
+var rtkAsset = map[string]string{
+	"amd64": "rtk-x86_64-unknown-linux-musl.tar.gz",
+	"arm64": "rtk-aarch64-unknown-linux-gnu.tar.gz",
+}
+
+var rtkSHA256 = map[string]string{
+	"amd64": "ff8a1e7766496e175291a85aeca1dc97c9ff6df33e51e5893d1fbc78fea2a609",
+	"arm64": "5519f7ca12e5c143a609f0d28a0a77b97413a8dce31c2681f1a41c24519a8731",
+}
+
+// rtkInstallScript returns the bash that downloads the pinned rtk release
+// asset, verifies it against the clem-pinned digest, and lands the binary at
+// /usr/local/bin/rtk. Split from InstallRTK so tests can pin the
+// supply-chain contract without network or root.
+func rtkInstallScript(asset, sha string) string {
+	return fmt.Sprintf(`set -euo pipefail
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT; cd "$TMP"
+curl -fsSL -o "%[1]s" "https://github.com/rtk-ai/rtk/releases/download/v%[2]s/%[1]s"
+echo "%[3]s  %[1]s" | sha256sum -c --quiet -
+tar -xzf "%[1]s" rtk
+install -m 0755 rtk /usr/local/bin/rtk`, asset, RTKVersion, sha)
+}
+
+// InstallRTK installs the rtk output-filter CLI and its hook for the given
+// user. The binary install is host-global and idempotent (skipped when the
+// pinned version is already at /usr/local/bin/rtk); `rtk init` then writes
+// rtk's PreToolUse hook into the user's ~/.claude/settings.json, so callers
+// must run this after WriteSettings, which rewrites that file wholesale and
+// would drop the hook. Callers may treat failure as a warning: agents run
+// fine without rtk.
+func InstallRTK(username string) error {
+	sha, ok := rtkSHA256[runtime.GOARCH]
+	if !ok {
+		return fmt.Errorf("unsupported arch %q for rtk install", runtime.GOARCH)
+	}
+	verCheck := "/usr/local/bin/rtk --version 2>/dev/null"
+	if out, err := sys.Run("bash", "-c", verCheck); err != nil ||
+		!strings.Contains(string(out), RTKVersion) {
+		fmt.Printf("  installing rtk %s (%s)\n", RTKVersion, runtime.GOARCH)
+		if out, err := sys.Run("bash", "-c", rtkInstallScript(rtkAsset[runtime.GOARCH], sha)); err != nil {
+			return fmt.Errorf("installing rtk %s: %w\n%s", RTKVersion, err, out)
+		}
+	}
+	if out, err := sys.Run("sudo", "-iu", username, "rtk", "init", "-g", "--hook-only", "--auto-patch"); err != nil {
+		return fmt.Errorf("rtk init for %s: %w\n%s", username, err, out)
 	}
 	return nil
 }
@@ -1328,9 +1428,10 @@ func InstallSkill(username string, s config.SkillConfig) error {
 
 // SyncSkillsRepo clones (or pulls) repoURL into <homeDir>/.cache/<repoName>/
 // as the agent user, then symlinks every subdir under shared/ and <agentKey>/
-// into <homeDir>/.claude/skills/<name>. Symlinks pointing into the cache that
-// no longer resolve are pruned, so removing a skill in the repo propagates on
-// next sync. Idempotent.
+// into every supported runtime's user skill directory: ~/.claude/skills,
+// ~/.agents/skills, and ~/.config/opencode/skills. Symlinks pointing into the
+// cache that no longer resolve are pruned, so removing a skill in the repo
+// propagates on next sync. Idempotent.
 //
 // repoURL is any URL git clone understands (https, ssh, git@host:path).
 // agentKey selects which per-agent subdir to surface. Top-level dirs other
@@ -1385,7 +1486,11 @@ type cmdRunner func(name string, args ...string) ([]byte, error)
 func syncSkillsCommon(homeDir, agentKey, repoURL string, run cmdRunner, mkDir func(string) error) error {
 	repoName := skillsCacheName(repoURL)
 	cache := filepath.Join(homeDir, ".cache", repoName)
-	skillsDir := filepath.Join(homeDir, ".claude", "skills")
+	skillsDirs := []string{
+		filepath.Join(homeDir, ".claude", "skills"),
+		filepath.Join(homeDir, ".agents", "skills"),
+		filepath.Join(homeDir, ".config", "opencode", "skills"),
+	}
 
 	if _, err := os.Stat(cache); os.IsNotExist(err) {
 		if err := mkDir(filepath.Dir(cache)); err != nil {
@@ -1402,8 +1507,10 @@ func syncSkillsCommon(homeDir, agentKey, repoURL string, run cmdRunner, mkDir fu
 		}
 	}
 
-	if err := mkDir(skillsDir); err != nil {
-		return fmt.Errorf("ensuring skills dir: %w", err)
+	for _, skillsDir := range skillsDirs {
+		if err := mkDir(skillsDir); err != nil {
+			return fmt.Errorf("ensuring skills dir %s: %w", skillsDir, err)
+		}
 	}
 
 	expected := make(map[string]string)
@@ -1430,15 +1537,19 @@ func syncSkillsCommon(homeDir, agentKey, repoURL string, run cmdRunner, mkDir fu
 				continue
 			}
 			target := filepath.Join(srcDir, name)
-			link := filepath.Join(skillsDir, name)
-			if out, err := run("ln", "-sfn", target, link); err != nil {
-				return fmt.Errorf("symlinking skill %s: %w\n%s", name, err, out)
+			for _, skillsDir := range skillsDirs {
+				link := filepath.Join(skillsDir, name)
+				if out, err := run("ln", "-sfn", target, link); err != nil {
+					return fmt.Errorf("symlinking skill %s into %s: %w\n%s", name, skillsDir, err, out)
+				}
 			}
 			expected[name] = src
 		}
 	}
 
-	pruneStaleSkillSymlinks(skillsDir, cache, expected, run)
+	for _, skillsDir := range skillsDirs {
+		pruneStaleSkillSymlinks(skillsDir, cache, expected, run)
+	}
 	return nil
 }
 
@@ -1480,17 +1591,24 @@ func pruneStaleSkillSymlinks(skillsDir, cache string, expected map[string]string
 	}
 }
 
-// SetMCPServers overwrites the mcpServers key in ~/.claude/settings.json while
-// preserving all other settings. Vault refs in env values are expanded via secrets.
-func SetMCPServers(homeDir string, servers []config.MCPServerConfig, secrets map[string]string) error {
-	settingsPath := filepath.Join(homeDir, ".claude", "settings.json")
-	raw, err := os.ReadFile(settingsPath)
-	if err != nil {
-		return fmt.Errorf("reading settings.json: %w", err)
-	}
-	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return fmt.Errorf("parsing settings.json: %w", err)
+// SetMCPServers overwrites the mcpServers key in the agent's ~/.claude.json
+// while preserving everything else Claude Code keeps there. Claude Code does
+// not load MCP servers from settings.json — only ~/.claude.json or a project
+// .mcp.json count (and the runner regenerates .mcp.json, so it is not ours to
+// write). The file may not exist before the agent's first session. Vault refs
+// in env values are expanded via secrets, so the result is chowned to the
+// agent and kept 0600.
+func SetMCPServers(username, homeDir string, servers []config.MCPServerConfig, secrets map[string]string) error {
+	claudeJSONPath := filepath.Join(homeDir, ".claude.json")
+	doc := map[string]any{}
+	raw, err := os.ReadFile(claudeJSONPath)
+	switch {
+	case err == nil:
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return fmt.Errorf("parsing .claude.json: %w", err)
+		}
+	case !os.IsNotExist(err):
+		return fmt.Errorf("reading .claude.json: %w", err)
 	}
 	mcpMap := make(map[string]any, len(servers))
 	for _, srv := range servers {
@@ -1517,9 +1635,34 @@ func SetMCPServers(homeDir string, servers []config.MCPServerConfig, secrets map
 	doc["mcpServers"] = mcpMap
 	out, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshaling settings.json: %w", err)
+		return fmt.Errorf("marshaling .claude.json: %w", err)
 	}
-	return os.WriteFile(settingsPath, append(out, '\n'), 0644)
+	if err := os.WriteFile(claudeJSONPath, append(out, '\n'), 0600); err != nil {
+		return fmt.Errorf("writing .claude.json: %w", err)
+	}
+	if err := chownToUser(claudeJSONPath, username); err != nil {
+		return err
+	}
+
+	// Keep one runtime-neutral generated manifest. Non-Claude runners translate
+	// this into their native config on launch, so clem.yaml remains the only MCP
+	// source of truth across claude-code, opencode, and codex.
+	clemDir := filepath.Join(homeDir, ".clem")
+	if err := os.MkdirAll(clemDir, 0700); err != nil {
+		return fmt.Errorf("creating .clem directory: %w", err)
+	}
+	manifestPath := filepath.Join(clemDir, "mcp-servers.json")
+	manifest, err := json.MarshalIndent(mcpMap, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling runtime-neutral MCP manifest: %w", err)
+	}
+	if err := os.WriteFile(manifestPath, append(manifest, '\n'), 0600); err != nil {
+		return fmt.Errorf("writing runtime-neutral MCP manifest: %w", err)
+	}
+	if err := chownToUser(manifestPath, username); err != nil {
+		return err
+	}
+	return chownToUser(clemDir, username)
 }
 
 // InstallExtensions installs marketplaces, plugins, skills, and MCP servers for
@@ -1551,7 +1694,7 @@ func InstallExtensions(username, homeDir string, ext config.ExtensionsConfig, ca
 		}
 	}
 	if len(ext.MCPServers) > 0 {
-		if err := SetMCPServers(homeDir, ext.MCPServers, secrets); err != nil {
+		if err := SetMCPServers(username, homeDir, ext.MCPServers, secrets); err != nil {
 			return err
 		}
 	}

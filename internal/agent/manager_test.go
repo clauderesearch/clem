@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -45,6 +47,49 @@ func withStub(t *testing.T) *stubExec {
 	sys = stub
 	t.Cleanup(func() { sys = orig })
 	return stub
+}
+
+// TestRTKInstallScript_PinsDigestAndDest pins the supply-chain contract: the
+// install script must fetch the exact pinned release asset, refuse a tarball
+// whose sha256 differs from the clem-pinned digest, and land the binary at
+// /usr/local/bin/rtk. Would catch a pin bump that forgot the digest, or a
+// refactor that drops verification.
+func TestRTKInstallScript_PinsDigestAndDest(t *testing.T) {
+	for arch, asset := range rtkAsset {
+		s := rtkInstallScript(asset, rtkSHA256[arch])
+		for _, want := range []string{
+			"set -euo pipefail",
+			"releases/download/v" + RTKVersion + "/" + asset,
+			rtkSHA256[arch] + "  " + asset,
+			"sha256sum -c",
+			"install -m 0755 rtk /usr/local/bin/rtk",
+		} {
+			if !strings.Contains(s, want) {
+				t.Errorf("%s install script missing %q:\n%s", arch, want, s)
+			}
+		}
+	}
+}
+
+// TestInstallRTK_InstallsThenInitsHook pins the flow and its order: ensure
+// the pinned binary (version probe, then verified download) before running
+// `rtk init` as the agent user — init would fail with no binary, and the
+// hook must be written for the nag-suppression contract to hold.
+func TestInstallRTK_InstallsThenInitsHook(t *testing.T) {
+	stub := withStub(t)
+	if err := InstallRTK("myteam-lead"); err != nil {
+		t.Fatalf("InstallRTK: %v", err)
+	}
+	if len(stub.calls) != 3 {
+		t.Fatalf("want 3 calls (version probe, install, init), got %d: %v", len(stub.calls), stub.calls)
+	}
+	if got := stub.calls[1][2]; !strings.Contains(got, "sha256sum -c") {
+		t.Errorf("second call should run the verified install script, got %q", got)
+	}
+	init := strings.Join(stub.calls[2], " ")
+	if init != "sudo -iu myteam-lead rtk init -g --hook-only --auto-patch" {
+		t.Errorf("unexpected init call: %q", init)
+	}
 }
 
 // TestSecretPatternRegex_MatchesKnownCredentials verifies the regex actually
@@ -871,8 +916,12 @@ func TestWriteEnvFile_WritesSecretsAndGitignore(t *testing.T) {
 	dir := t.TempDir()
 	secrets := map[string]string{"GH_TOKEN": "gh-test-token", "FOO": "bar"}
 
-	if err := WriteEnvFile("testuser", dir, secrets); err != nil {
+	changed, err := WriteEnvFile("testuser", dir, secrets)
+	if err != nil {
 		t.Fatalf("WriteEnvFile: %v", err)
+	}
+	if !changed {
+		t.Error("first write should report changed")
 	}
 
 	envData, err := os.ReadFile(filepath.Join(dir, ".env"))
@@ -903,7 +952,7 @@ func TestWriteEnvFile_SingleQuotesSpecialChars(t *testing.T) {
 		"QUOTE":    "it's here",
 	}
 
-	if err := WriteEnvFile("testuser", dir, secrets); err != nil {
+	if _, err := WriteEnvFile("testuser", dir, secrets); err != nil {
 		t.Fatalf("WriteEnvFile: %v", err)
 	}
 
@@ -1447,22 +1496,28 @@ func TestSyncSkillsRepo_SymlinksSharedAndAgent(t *testing.T) {
 		t.Fatalf("SyncSkillsRepo: %v", err)
 	}
 
-	skillsDir := filepath.Join(home, ".claude", "skills")
-	for _, name := range []string{"skill-a", "skill-b"} {
-		link := filepath.Join(skillsDir, name)
-		target, err := os.Readlink(link)
-		if err != nil {
-			t.Errorf("%s: expected symlink, got: %v", name, err)
-			continue
-		}
-		if !strings.HasPrefix(target, cache+string(filepath.Separator)) {
-			t.Errorf("%s: symlink target %q not under cache %q", name, target, cache)
-		}
+	skillsDirs := []string{
+		filepath.Join(home, ".claude", "skills"),
+		filepath.Join(home, ".agents", "skills"),
+		filepath.Join(home, ".config", "opencode", "skills"),
 	}
-	// skill-c (lead) and skill-d (random-dir) must NOT appear for worker
-	for _, name := range []string{"skill-c", "skill-d"} {
-		if _, err := os.Lstat(filepath.Join(skillsDir, name)); err == nil {
-			t.Errorf("worker should not see %s", name)
+	for _, skillsDir := range skillsDirs {
+		for _, name := range []string{"skill-a", "skill-b"} {
+			link := filepath.Join(skillsDir, name)
+			target, err := os.Readlink(link)
+			if err != nil {
+				t.Errorf("%s/%s: expected symlink, got: %v", skillsDir, name, err)
+				continue
+			}
+			if !strings.HasPrefix(target, cache+string(filepath.Separator)) {
+				t.Errorf("%s: symlink target %q not under cache %q", name, target, cache)
+			}
+		}
+		// skill-c (lead) and skill-d (random-dir) must NOT appear for worker.
+		for _, name := range []string{"skill-c", "skill-d"} {
+			if _, err := os.Lstat(filepath.Join(skillsDir, name)); err == nil {
+				t.Errorf("worker should not see %s in %s", name, skillsDir)
+			}
 		}
 	}
 
@@ -1645,8 +1700,12 @@ func TestSyncSkillsRepo_RoutesGitThroughBrokerEnv(t *testing.T) {
 		name string
 		sync func(home string) error
 	}{
-		{"provision", func(home string) error { return SyncSkillsRepo("testuser", home, "worker", "https://example.com/owner/team-skills.git") }},
-		{"self", func(home string) error { return SyncSkillsRepoAsSelf(home, "worker", "https://example.com/owner/team-skills.git") }},
+		{"provision", func(home string) error {
+			return SyncSkillsRepo("testuser", home, "worker", "https://example.com/owner/team-skills.git")
+		}},
+		{"self", func(home string) error {
+			return SyncSkillsRepoAsSelf(home, "worker", "https://example.com/owner/team-skills.git")
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stub := withSkillsStub(t)
@@ -1738,70 +1797,6 @@ func TestEnsureSystemUser_SkipsWhenExists(t *testing.T) {
 	}
 }
 
-func TestInstallPipelock_PinnedDownloadWhenAbsent(t *testing.T) {
-	// Default stub returns empty output for the version-check bash call, so the
-	// pinned version is not detected and the download proceeds.
-	stub := withStub(t)
-	if err := InstallPipelock(); err != nil {
-		t.Fatalf("InstallPipelock: %v", err)
-	}
-	var script string
-	for _, c := range stub.calls {
-		if c[0] == "bash" && len(c) >= 3 && strings.Contains(c[2], "releases/download") {
-			script = c[2]
-		}
-	}
-	if script == "" {
-		t.Fatal("expected bash install (download) script to run")
-	}
-	for _, want := range []string{
-		PipelockVersion,
-		"releases/download",
-		"sha256sum -c -",
-		"no checksum line for", // empty-grep guard
-		"install -m 0755 pipelock /usr/local/bin/pipelock",
-	} {
-		if !strings.Contains(script, want) {
-			t.Errorf("install script missing %q:\n%s", want, script)
-		}
-	}
-}
-
-func TestInstallPipelock_SkipsWhenPinnedPresent(t *testing.T) {
-	orig := sys
-	t.Cleanup(func() { sys = orig })
-	// The version-check bash call reports the pinned version → no download.
-	rec := &versionStub{version: PipelockVersion}
-	sys = rec
-	if err := InstallPipelock(); err != nil {
-		t.Fatalf("InstallPipelock: %v", err)
-	}
-	if rec.downloaded {
-		t.Fatal("should not download when pinned version already present")
-	}
-}
-
-// versionStub reports the pinned version for the version-check bash invocation
-// and records whether a download (bash script referencing the release) ran.
-type versionStub struct {
-	version    string
-	downloaded bool
-}
-
-func (v *versionStub) Run(name string, args ...string) ([]byte, error) {
-	if name == "bash" && len(args) >= 2 {
-		script := args[1]
-		if strings.Contains(script, "releases/download") {
-			v.downloaded = true
-			return nil, nil
-		}
-		if strings.Contains(script, "--version") {
-			return []byte("pipelock " + strings.TrimPrefix(v.version, "v")), nil
-		}
-	}
-	return nil, nil
-}
-
 func TestBrokeredEnv_PlaceholdersAndConnection(t *testing.T) {
 	av := config.VaultBackend{Backend: "agent-vault"}
 	ac := config.AgentConfig{
@@ -1832,7 +1827,7 @@ func TestBrokeredEnv_PlaceholdersAndConnection(t *testing.T) {
 		}
 	}
 	// Connection + CA trust.
-	if env["HTTPS_PROXY"] != "https://av_agt_tok:anthropic@127.0.0.1:14322" {
+	if env["HTTPS_PROXY"] != "http://av_agt_tok:anthropic@127.0.0.1:14322" {
 		t.Errorf("HTTPS_PROXY=%q", env["HTTPS_PROXY"])
 	}
 	if env["AGENT_VAULT_TOKEN"] != "av_agt_tok" || env["AGENT_VAULT_VAULT"] != "anthropic" {
@@ -1841,12 +1836,11 @@ func TestBrokeredEnv_PlaceholdersAndConnection(t *testing.T) {
 	if env["NODE_EXTRA_CA_CERTS"] != "/etc/clem/agent-vault-ca.pem" {
 		t.Errorf("NODE_EXTRA_CA_CERTS=%q", env["NODE_EXTRA_CA_CERTS"])
 	}
-	// git tunnels through the TLS proxy, so it must trust the agent-vault CA for
-	// the proxy connection too (http.proxySSLCAInfo) — else every git op fails.
-	if env["GIT_CONFIG_COUNT"] != "1" || env["GIT_CONFIG_KEY_0"] != "http.proxySSLCAInfo" ||
-		env["GIT_CONFIG_VALUE_0"] != "/etc/clem/agent-vault-ca.pem" {
-		t.Errorf("git proxy CA config missing/wrong: COUNT=%q KEY_0=%q VALUE_0=%q",
-			env["GIT_CONFIG_COUNT"], env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_VALUE_0"])
+	// The local proxy hop is plain HTTP from agent-vault v0.23 onward. Git still
+	// trusts the intercepted upstream via GIT_SSL_CAINFO, but must not be told
+	// that the proxy itself uses TLS.
+	if _, ok := env["GIT_CONFIG_COUNT"]; ok {
+		t.Errorf("unexpected TLS-proxy git config: %v", env)
 	}
 }
 
@@ -1992,5 +1986,197 @@ func TestAuthMode(t *testing.T) {
 func TestAuthMode_NoEnvFile(t *testing.T) {
 	if got := AuthMode(t.TempDir()); got != "" {
 		t.Errorf("AuthMode with no .env = %q, want empty", got)
+	}
+}
+
+func TestTryRestartService_UsesTryRestart(t *testing.T) {
+	stub := withStub(t)
+	if err := TryRestartService("clem-cdev-lead.service"); err != nil {
+		t.Fatalf("TryRestartService: %v", err)
+	}
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected one Run call, got %v", stub.calls)
+	}
+	want := []string{"systemctl", "try-restart", "clem-cdev-lead.service"}
+	if !reflect.DeepEqual(stub.calls[0], want) {
+		t.Errorf("call = %v, want %v", stub.calls[0], want)
+	}
+}
+
+func TestTryRestartService_Error(t *testing.T) {
+	stub := withStub(t)
+	stub.failOn = "systemctl"
+	if err := TryRestartService("clem-x.service"); err == nil {
+		t.Error("expected error when systemctl fails")
+	}
+}
+
+func TestWriteEnvFile_StableAndChangeDetected(t *testing.T) {
+	withStub(t)
+	dir := t.TempDir()
+	secrets := map[string]string{"B_KEY": "2", "A_KEY": "1"}
+
+	if changed, err := WriteEnvFile("testuser", dir, secrets); err != nil || !changed {
+		t.Fatalf("first write: changed=%v err=%v, want true nil", changed, err)
+	}
+	// Same content rewritten must be byte-identical (sorted keys) → unchanged,
+	// so provision does not restart running agents on a no-op re-provision.
+	if changed, err := WriteEnvFile("testuser", dir, secrets); err != nil || changed {
+		t.Fatalf("identical rewrite: changed=%v err=%v, want false nil", changed, err)
+	}
+	envData, _ := os.ReadFile(filepath.Join(dir, ".env"))
+	if !strings.HasPrefix(string(envData), "export A_KEY='1'\nexport B_KEY='2'\n") {
+		t.Errorf(".env not sorted: %s", envData)
+	}
+
+	secrets["C_KEY"] = "3"
+	if changed, err := WriteEnvFile("testuser", dir, secrets); err != nil || !changed {
+		t.Fatalf("modified write: changed=%v err=%v, want true nil", changed, err)
+	}
+}
+
+func TestReadEnvValue_RoundTrip(t *testing.T) {
+	withStub(t)
+	dir := t.TempDir()
+	secrets := map[string]string{
+		"AGENT_VAULT_TOKEN": "av_agt_abc123",
+		"QUOTED":            "it's here",
+	}
+	if _, err := WriteEnvFile("testuser", dir, secrets); err != nil {
+		t.Fatalf("WriteEnvFile: %v", err)
+	}
+	if got := ReadEnvValue(dir, "AGENT_VAULT_TOKEN"); got != "av_agt_abc123" {
+		t.Errorf("AGENT_VAULT_TOKEN = %q", got)
+	}
+	if got := ReadEnvValue(dir, "QUOTED"); got != "it's here" {
+		t.Errorf("QUOTED = %q, escaping not round-tripped", got)
+	}
+	if got := ReadEnvValue(dir, "MISSING"); got != "" {
+		t.Errorf("MISSING = %q, want empty", got)
+	}
+	if got := ReadEnvValue(filepath.Join(dir, "nope"), "AGENT_VAULT_TOKEN"); got != "" {
+		t.Errorf("no .env = %q, want empty", got)
+	}
+}
+
+func TestProxyTokenValid_ProbesThroughProxy(t *testing.T) {
+	stub := withStub(t)
+	av := config.VaultBackend{}
+	if !ProxyTokenValid(av, "av_agt_tok", "cdev_lead") {
+		t.Fatal("valid probe should return true")
+	}
+	if len(stub.calls) != 1 || stub.calls[0][0] != "curl" {
+		t.Fatalf("expected one curl call, got %v", stub.calls)
+	}
+	joined := strings.Join(stub.calls[0], " ")
+	// Vault name must be agent-vault-normalized ('_' rejected there).
+	if !strings.Contains(joined, "av_agt_tok") || strings.Contains(joined, "cdev_lead") {
+		t.Errorf("proxy URL not built from token + normalized vault: %s", joined)
+	}
+
+	stub.failOn = "curl"
+	if ProxyTokenValid(av, "av_agt_tok", "cdev_lead") {
+		t.Error("failed probe (407/unreachable) must report invalid so caller rotates")
+	}
+}
+
+func TestSetMCPServersWritesClaudeJSON(t *testing.T) {
+	withStub(t) // chown is stubbed
+	home := t.TempDir()
+
+	servers := []config.MCPServerConfig{{
+		Name:    "browser-render",
+		Command: "mcp-browser-render",
+		Env: map[string]string{
+			"BROWSER_RENDER_API_KEY": "${vault:infra.BROWSER_RENDER_API_KEY}",
+		},
+	}}
+	secrets := map[string]string{"infra.BROWSER_RENDER_API_KEY": "sekrit"}
+
+	// File absent: created from scratch.
+	if err := SetMCPServers("cdev_worker", home, servers, secrets); err != nil {
+		t.Fatalf("SetMCPServers (no file): %v", err)
+	}
+	path := filepath.Join(home, ".claude.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf(".claude.json not written: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parsing .claude.json: %v", err)
+	}
+	entry := doc["mcpServers"].(map[string]any)["browser-render"].(map[string]any)
+	if entry["type"] != "stdio" || entry["command"] != "mcp-browser-render" {
+		t.Errorf("bad entry: %v", entry)
+	}
+	if got := entry["env"].(map[string]any)["BROWSER_RENDER_API_KEY"]; got != "sekrit" {
+		t.Errorf("vault ref not expanded: %v", got)
+	}
+	if fi, _ := os.Stat(path); fi.Mode().Perm() != 0600 {
+		t.Errorf(".claude.json mode = %v, want 0600 (env holds secrets)", fi.Mode().Perm())
+	}
+	manifestPath := filepath.Join(home, ".clem", "mcp-servers.json")
+	manifestRaw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("runtime-neutral MCP manifest not written: %v", err)
+	}
+	var manifest map[string]any
+	if err := json.Unmarshal(manifestRaw, &manifest); err != nil {
+		t.Fatalf("parsing runtime-neutral MCP manifest: %v", err)
+	}
+	managed := manifest["browser-render"].(map[string]any)
+	if managed["command"] != "mcp-browser-render" {
+		t.Errorf("bad runtime-neutral entry: %v", managed)
+	}
+	if got := managed["env"].(map[string]any)["BROWSER_RENDER_API_KEY"]; got != "sekrit" {
+		t.Errorf("runtime-neutral manifest leaked unresolved vault ref: %v", got)
+	}
+
+	// File present with Claude Code state: other keys preserved.
+	if err := os.WriteFile(path, []byte(`{"oauthAccount":{"x":1},"mcpServers":{"old":{}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetMCPServers("cdev_worker", home, servers, secrets); err != nil {
+		t.Fatalf("SetMCPServers (existing file): %v", err)
+	}
+	raw, _ = os.ReadFile(path)
+	doc = map[string]any{}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc["oauthAccount"]; !ok {
+		t.Error("existing .claude.json keys must be preserved")
+	}
+	if _, ok := doc["mcpServers"].(map[string]any)["old"]; ok {
+		t.Error("mcpServers must be overwritten, not merged")
+	}
+}
+
+// TestStartService_EnablesUnit pins that 'clem start' re-enables units: after
+// 'clem stop' the units are disabled, and a plain 'systemctl
+// start' would leave them invisible to the watchdog (which skips disabled
+// units) and lost on reboot.
+func TestStartService_EnablesUnit(t *testing.T) {
+	stub := withStub(t)
+	if err := StartService("foo.service"); err != nil {
+		t.Fatalf("StartService: %v", err)
+	}
+	want := []string{"systemctl", "enable", "--now", "foo.service"}
+	if len(stub.calls) != 1 || !slices.Equal(stub.calls[0], want) {
+		t.Errorf("calls = %v, want [%v]", stub.calls, want)
+	}
+}
+
+// TestDisableNowService_DisablesUnit pins the permanent-stop primitive:
+// disable --now is what makes the watchdog leave the unit alone.
+func TestDisableNowService_DisablesUnit(t *testing.T) {
+	stub := withStub(t)
+	if err := DisableNowService("foo.service"); err != nil {
+		t.Fatalf("DisableNowService: %v", err)
+	}
+	want := []string{"systemctl", "disable", "--now", "foo.service"}
+	if len(stub.calls) != 1 || !slices.Equal(stub.calls[0], want) {
+		t.Errorf("calls = %v, want [%v]", stub.calls, want)
 	}
 }

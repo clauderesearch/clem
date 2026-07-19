@@ -33,6 +33,43 @@ func baseCfg(agentKey string, ac config.AgentConfig) *config.Config {
 	}
 }
 
+func TestGenerate_HeadroomWrapsClaudeLaunch(t *testing.T) {
+	cfg := baseCfg("lead", config.AgentConfig{
+		Name:      "Lead",
+		Model:     "claude-opus-4-8",
+		Iteration: "1m",
+		Prompt:    "do the thing",
+		Headroom:  true,
+	})
+	out := Generate(cfg, "lead")
+	for _, want := range []string{
+		`"$CLAUDE" mcp remove headroom`,
+		"headroom wrap claude -p $HEADROOM_PORT --no-context-tool --no-serena",
+		`log "headroom enabled but not installed; launching claude directly"`,
+		"timeout 7200 $LAUNCH --dangerously-skip-permissions",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in runner, got:\n%s", want, out)
+		}
+	}
+}
+
+func TestGenerate_HeadroomOffLaunchesClaudeDirectly(t *testing.T) {
+	cfg := baseCfg("lead", config.AgentConfig{
+		Name:      "Lead",
+		Model:     "claude-opus-4-8",
+		Iteration: "1m",
+		Prompt:    "do the thing",
+	})
+	out := Generate(cfg, "lead")
+	if strings.Contains(out, "headroom") {
+		t.Errorf("headroom disabled but wrap present in runner:\n%s", out)
+	}
+	if !strings.Contains(out, `LAUNCH="$CLAUDE"`) {
+		t.Errorf("expected direct claude launch, got:\n%s", out)
+	}
+}
+
 func TestGenerate_CavemanInjectsLevel(t *testing.T) {
 	for _, level := range []config.CavemanLevel{config.CavemanLite, config.CavemanFull, config.CavemanUltra} {
 		cfg := baseCfg("lead", config.AgentConfig{
@@ -76,7 +113,7 @@ func TestGenerate_DisablesAutoUpdaterForSessionOnly(t *testing.T) {
 	out := Generate(cfg, "lead")
 	// The interactive TUI launch disables the in-session auto-updater (its
 	// banner can't be cleared on a brokered-proxy host).
-	if !strings.Contains(out, "DISABLE_AUTOUPDATER=1 timeout 7200 $CLAUDE") {
+	if !strings.Contains(out, "DISABLE_AUTOUPDATER=1 timeout 7200 $LAUNCH") {
 		t.Errorf("expected DISABLE_AUTOUPDATER on the claude launch, got:\n%s", out)
 	}
 	// ...but the explicit `claude install` must stay enabled so updates happen.
@@ -93,7 +130,7 @@ func TestGenerate_SkipsClaudeInstallOnProxyHosts(t *testing.T) {
 		Prompt:    "do the thing",
 	})
 	out := Generate(cfg, "lead")
-	// claude install (bun fetch) can't traverse the pipelock proxy — it fails
+	// claude install (bun fetch) can't traverse the egress proxy — it fails
 	// "Socket is closed" every iteration. Skip it when HTTPS_PROXY is set.
 	if !strings.Contains(out, `if [ -n "$HTTPS_PROXY" ]; then`) {
 		t.Errorf("expected claude install gated on HTTPS_PROXY, got:\n%s", out)
@@ -403,12 +440,12 @@ func TestGenerateService_EgressEnabledLoopbackOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateService: %v", err)
 	}
-	// Loopback-only block + pipelock/nftables unit ordering, no hardcoded CIDRs.
+	// Loopback-only block + agent-vault/nftables unit ordering, no hardcoded CIDRs.
 	for _, want := range []string{
 		"IPAddressDeny=any",
 		"IPAddressAllow=127.0.0.0/8",
-		"After=clem-pipelock-test.service clem-nftables-test.service",
-		"Wants=clem-pipelock-test.service",
+		"After=clem-agent-vault-test.service clem-nftables-test.service",
+		"Wants=clem-agent-vault-test.service",
 		"Requires=clem-nftables-test.service", // firewall is fail-closed
 	} {
 		if !strings.Contains(out, want) {
@@ -455,40 +492,8 @@ func TestGenerateService_EgressDisabled(t *testing.T) {
 	if strings.Contains(out, "IPAddressDeny") {
 		t.Fatalf("expected no IPAddressDeny when egress unset, got:\n%s", out)
 	}
-	if strings.Contains(out, "clem-pipelock") {
-		t.Fatalf("expected no pipelock unit deps when egress unset, got:\n%s", out)
-	}
-}
-
-func TestGenerate_ProxyExportPresentWhenEgressEnabled(t *testing.T) {
-	cfg := baseCfg("worker", config.AgentConfig{
-		Name:      "Worker",
-		Model:     "claude-opus-4-7",
-		Iteration: "1m",
-		Prompt:    "do the thing",
-	})
-	cfg.Egress = config.EgressConfig{Enabled: true, ProxyPort: 9001}
-
-	out := Generate(cfg, "worker")
-	if !strings.Contains(out, "export HTTPS_PROXY=http://127.0.0.1:9001") {
-		t.Errorf("expected HTTPS_PROXY export at configured port, got:\n%s", out)
-	}
-	if !strings.Contains(out, "export NO_PROXY=127.0.0.1,localhost,::1") {
-		t.Errorf("expected NO_PROXY export, got:\n%s", out)
-	}
-}
-
-func TestGenerate_NoProxyExportWhenEgressDisabled(t *testing.T) {
-	cfg := baseCfg("worker", config.AgentConfig{
-		Name:      "Worker",
-		Model:     "claude-opus-4-7",
-		Iteration: "1m",
-		Prompt:    "do the thing",
-	})
-
-	out := Generate(cfg, "worker")
-	if strings.Contains(out, "export HTTPS_PROXY") {
-		t.Errorf("expected no HTTPS_PROXY export when egress disabled, got:\n%s", out)
+	if strings.Contains(out, "clem-agent-vault") {
+		t.Fatalf("expected no agent-vault unit deps when egress unset, got:\n%s", out)
 	}
 }
 
@@ -733,30 +738,84 @@ func TestGenerate_CodexRunnerSelected(t *testing.T) {
 		Name:      "Lead",
 		Runtime:   "codex",
 		Model:     "gpt-5.4-codex",
+		Effort:    "high",
 		Iteration: "1m",
 		Prompt:    "do the thing. When done, run: kill $PPID",
 	})
 	out := Generate(cfg, "lead")
 
 	for _, want := range []string{
-		`CODEX="$HOME/.npm-global/bin/codex"`,            // codex binary path
-		"~/.codex/config.toml",                            // TOML config target
-		`cli_auth_credentials_store = \"file\"`,           // headless auth store
-		`forced_login_method = \"chatgpt\"`,               // clem login OAuth flow
-		"[mcp_servers.",                                    // TOML MCP tables
-		"--dangerously-bypass-approvals-and-sandbox",      // unattended execution
-		`timeout 7200 "$CODEX"`,                            // 2h interactive TUI cap
-		"tmux send-keys -l -t lead",                        // prompt injection contract
-		"--model gpt-5.4-codex",                            // model passthrough
+		`CODEX="$HOME/.npm-global/bin/codex"`, // codex binary path
+		`CODEX_UPDATER="$HOME/.local/bin/clem-codex-update"`,
+		"~/.codex/config.toml",                       // TOML config target
+		`cli_auth_credentials_store = \"file\"`,      // headless auth store
+		`forced_login_method = \"chatgpt\"`,          // clem login OAuth flow
+		`check_for_update_on_startup = false`,        // Clem owns staged updates
+		`model_reasoning_effort = \"high\"`,          // harness-neutral effort passthrough
+		"[mcp_servers.",                              // TOML MCP tables
+		"~/.clem/mcp-servers.json",                   // harness-neutral extension MCPs
+		"--dangerously-bypass-approvals-and-sandbox", // unattended execution
+		`timeout 7200 "$CODEX"`,                      // 2h interactive TUI cap
+		"tmux send-keys -l -t lead",                  // prompt injection contract
+		"tmux send-keys -t lead Escape",              // close $ skill picker before submit
+		"--model gpt-5.4-codex",                      // model passthrough
+		`NEXT_EFFORT_FILE="$HOME/.clem/next-effort"`, // shared one-session effort handoff
+		`CODEX_EFFORT_ARGS=(-c "model_reasoning_effort=\"$NEXT_EFFORT\"")`,
+		`rollback-early "$PROMOTED_VERSION"`, // transactional early-failure rollback
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("codex runner missing %q\nfull output:\n%s", want, out)
 		}
 	}
+	if strings.Contains(out, "npm install -g") {
+		t.Errorf("codex runner must not update the live installation in place")
+	}
 
-	// Codex must NOT carry the Anthropic-only quota/effort machinery.
+	// Codex must NOT carry the Anthropic-only quota machinery.
 	if strings.Contains(out, "credentials.json") {
 		t.Errorf("codex runner should not reference claude credentials.json")
+	}
+}
+
+func TestGenerate_OpencodeRunnerMergesManagedMCPManifest(t *testing.T) {
+	cfg := baseCfg("lead", config.AgentConfig{
+		Name: "Lead", Runtime: "opencode", Iteration: "1m", Prompt: "do the thing",
+	})
+	out := Generate(cfg, "lead")
+	for _, want := range []string{"~/.clem/mcp-servers.json", "'type': 'local'", "'type': 'remote'"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("opencode runner missing managed MCP adapter %q", want)
+		}
+	}
+}
+
+func TestGenerate_CodexEffortMaxMapsToXHigh(t *testing.T) {
+	cfg := baseCfg("lead", config.AgentConfig{
+		Name: "Lead", Runtime: "codex", Effort: "max", Iteration: "1m", Prompt: "work",
+	})
+	out := Generate(cfg, "lead")
+	if !strings.Contains(out, `model_reasoning_effort = \"xhigh\"`) {
+		t.Fatalf("codex max effort should map to xhigh:\n%s", out)
+	}
+}
+
+func TestGenerate_CodexEmptyEffortLeavesDefault(t *testing.T) {
+	cfg := baseCfg("lead", config.AgentConfig{
+		Name: "Lead", Runtime: "codex", Iteration: "1m", Prompt: "work",
+	})
+	out := Generate(cfg, "lead")
+	if strings.Contains(out, "model_reasoning_effort =") {
+		t.Fatalf("empty effort should leave the Codex default unchanged:\n%s", out)
+	}
+}
+
+func TestGenerate_CodexSuccessfulShortRunUsesConfiguredInterval(t *testing.T) {
+	cfg := baseCfg("ops", config.AgentConfig{
+		Name: "Ops", Runtime: "codex", Iteration: "3h", Prompt: "check",
+	})
+	out := Generate(cfg, "ops")
+	if !strings.Contains(out, "if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 143 ]") {
+		t.Fatalf("successful Codex exits must use the configured iteration interval:\n%s", out)
 	}
 }
 
@@ -992,7 +1051,8 @@ func TestGenerate_NextEffortAndQuotaBlocks(t *testing.T) {
 	cfg := baseCfg("lead", config.AgentConfig{Name: "L", Iteration: "1m", Prompt: "p"})
 	out := Generate(cfg, "lead")
 	for _, want := range []string{
-		`if [ -f "$HOME/.claude/next-effort" ]`,
+		`NEXT_EFFORT_FILE="$HOME/.clem/next-effort"`,
+		`NEXT_EFFORT_FILE="$HOME/.claude/next-effort"`,
 		`export CLAUDE_CODE_EFFORT_LEVEL="$NEXT_EFFORT"`,
 		"unset CLAUDE_CODE_EFFORT_LEVEL",
 		`QUOTA_FILE="$HOME/.claude/quota.json"`,
